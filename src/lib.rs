@@ -61,6 +61,7 @@ impl From<bool> for Primitive {
     }
 }
 
+#[derive(Debug)]
 pub struct Payload {
     pub data: Vec<u8>,
     pub encoding: String,
@@ -75,6 +76,7 @@ impl From<Payload> for crate::pb::sepp::v1::Payload {
     }
 }
 
+#[derive(Debug)]
 pub struct Priority(u8);
 
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +107,7 @@ impl TryFrom<u8> for Priority {
     }
 }
 
+#[derive(Debug)]
 pub struct TraceContext {
     traceparent: String,
     tracestate: Option<String>,
@@ -228,16 +231,17 @@ impl From<TraceContext> for crate::pb::sepp::v1::TraceContext {
     }
 }
 
+#[derive(Debug)]
 pub struct EnqueueRequest {
-    pub queue: String,
-    pub job_type: String,
-    pub payload: Option<Payload>,
-    pub idempotency_key: Option<String>,
-    pub priority: Option<Priority>,
-    pub max_attempts: Option<u32>,
-    pub custom: HashMap<String, Primitive>,
-    pub trace_context: Option<TraceContext>,
-    pub scheduled_at: Option<SystemTime>,
+    queue: String,
+    job_type: String,
+    payload: Option<Payload>,
+    idempotency_key: Option<String>,
+    priority: Option<Priority>,
+    max_attempts: Option<u32>,
+    custom: HashMap<String, Primitive>,
+    trace_context: Option<TraceContext>,
+    scheduled_at: Option<SystemTime>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -330,6 +334,73 @@ impl From<EnqueueRequest> for crate::pb::sepp::v1::EnqueueRequest {
     }
 }
 
+#[derive(Debug)]
+pub struct BatchOutcome {
+    results: Vec<Result<EnqueueAck, JobRejection>>,
+}
+
+impl BatchOutcome {
+    pub fn all_succeeded(&self) -> bool {
+        self.results.iter().all(Result::is_ok)
+    }
+
+    pub fn results(&self) -> &[Result<EnqueueAck, JobRejection>] {
+        &self.results
+    }
+
+    pub fn rejected(&self) -> impl Iterator<Item = (usize, &JobRejection)> {
+        self.results
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.as_ref().err().map(|e| (i, e)))
+    }
+
+    pub fn succeeded(&self) -> impl Iterator<Item = (usize, &EnqueueAck)> {
+        self.results
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.as_ref().ok().map(|a| (i, a)))
+    }
+
+    pub fn into_results(self) -> Vec<Result<EnqueueAck, JobRejection>> {
+        self.results
+    }
+}
+
+#[derive(Debug)]
+pub struct EnqueueAck {
+    pub job_id: String,
+    pub deduplicated: bool,
+}
+
+impl From<crate::pb::sepp::v1::EnqueueResponse> for EnqueueAck {
+    fn from(r: crate::pb::sepp::v1::EnqueueResponse) -> Self {
+        Self {
+            job_id: r.job_id,
+            deduplicated: r.deduplicated,
+        }
+    }
+}
+
+// TODO: rethink this approach
+#[derive(Debug)]
+pub struct JobRejection {
+    pub code: String,
+    pub message: String,
+    pub context: HashMap<String, String>,
+}
+
+impl From<crate::pb::sepp::v1::ErrorDetails> for JobRejection {
+    fn from(e: crate::pb::sepp::v1::ErrorDetails) -> Self {
+        Self {
+            code: e.code,
+            message: e.message,
+            context: e.context,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct JobCtx {
     pub id: String,
     pub job_type: String,
@@ -342,11 +413,118 @@ pub struct JobCtx {
     pub lease_expires_at: SystemTime,
 }
 
+#[derive(Debug)]
 pub struct Job {
     pub payload: Option<Payload>,
     pub ctx: JobCtx,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum JobConversionError {
+    #[error("job is missing required field `{0}`")]
+    MissingField(&'static str),
+    #[error("job priority {0} is out of range (expected 0-9)")]
+    PriorityOutOfRange(u32),
+    #[error("job timestamp `{field}` is not a representable time ({value}ms)")]
+    InvalidTimestamp { field: &'static str, value: i64 },
+    #[error("custom value for key `{0}` has no value set")]
+    EmptyCustomValue(String),
+}
+
+impl From<crate::pb::sepp::v1::Payload> for Payload {
+    fn from(p: crate::pb::sepp::v1::Payload) -> Self {
+        Self {
+            data: p.data,
+            encoding: p.encoding,
+        }
+    }
+}
+
+impl TryFrom<crate::pb::sepp::v1::TraceContext> for TraceContext {
+    type Error = TraceContextError;
+
+    fn try_from(tc: crate::pb::sepp::v1::TraceContext) -> Result<Self, Self::Error> {
+        let mut ctx = TraceContext::new(tc.traceparent)?;
+        if let Some(ts) = tc.tracestate {
+            ctx = ctx.with_tracestate(ts);
+        }
+        Ok(ctx)
+    }
+}
+
+fn primitive_from_pb(v: crate::pb::sepp::v1::PrimitiveValue) -> Option<Primitive> {
+    use crate::pb::sepp::v1::primitive_value::Value;
+    Some(match v.value? {
+        Value::StringValue(s) => Primitive::String(s),
+        Value::DoubleValue(d) => Primitive::Double(d),
+        Value::IntValue(i) => Primitive::Int(i),
+        Value::BoolValue(b) => Primitive::Bool(b),
+    })
+}
+
+fn millis_to_system_time(ms: i64) -> Option<SystemTime> {
+    let ms = u64::try_from(ms).ok()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms))
+}
+
+impl TryFrom<crate::pb::sepp::v1::Job> for Job {
+    type Error = JobConversionError;
+
+    fn try_from(j: crate::pb::sepp::v1::Job) -> Result<Self, Self::Error> {
+        use JobConversionError as E;
+
+        if j.id.is_empty() {
+            return Err(E::MissingField("id"));
+        }
+        if j.job_type.is_empty() {
+            return Err(E::MissingField("job_type"));
+        }
+
+        let priority = u8::try_from(j.priority)
+            .ok()
+            .and_then(|p| Priority::new(p).ok())
+            .ok_or(E::PriorityOutOfRange(j.priority))?;
+
+        let enqueued_at = millis_to_system_time(j.enqueued_at).ok_or(E::InvalidTimestamp {
+            field: "enqueued_at",
+            value: j.enqueued_at,
+        })?;
+        let lease_expires_at =
+            millis_to_system_time(j.lease_expires_at).ok_or(E::InvalidTimestamp {
+                field: "lease_expires_at",
+                value: j.lease_expires_at,
+            })?;
+
+        let mut custom = HashMap::with_capacity(j.custom.len());
+        for (k, v) in j.custom {
+            let value = primitive_from_pb(v).ok_or_else(|| E::EmptyCustomValue(k.clone()))?;
+            custom.insert(k, value);
+        }
+
+        // An invalid trace context must not block job delivery: drop it and
+        // lose trace continuity rather than failing the whole reservation.
+        let trace_context = j
+            .trace_context
+            .and_then(|tc| TraceContext::try_from(tc).ok());
+
+        Ok(Job {
+            payload: j.payload.map(Into::into),
+            ctx: JobCtx {
+                id: j.id,
+                job_type: j.job_type,
+                priority,
+                attempt: j.attempt,
+                max_attempts: j.max_attempts,
+                enqueued_at,
+                custom,
+                trace_context,
+                lease_expires_at,
+            },
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct ReserveOptions {
     queues: Vec<String>,
     wait_timeout: Duration,
@@ -396,6 +574,10 @@ impl ReserveOptions {
         self
     }
 
+    pub fn wait_timeout(&self) -> Duration {
+        self.wait_timeout
+    }
+
     pub fn with_worker_id(mut self, id: impl Into<String>) -> Result<Self, ReserveOptionsError> {
         let id = id.into();
         if id.is_empty() {
@@ -408,11 +590,60 @@ impl ReserveOptions {
 
 impl From<ReserveOptions> for crate::pb::sepp::v1::ReserveRequest {
     fn from(o: ReserveOptions) -> Self {
+        Self::from(&o)
+    }
+}
+
+impl From<&ReserveOptions> for crate::pb::sepp::v1::ReserveRequest {
+    fn from(o: &ReserveOptions) -> Self {
         Self {
-            queues: o.queues,
+            queues: o.queues.clone(),
             wait_timeout_ms: o.wait_timeout.as_millis() as u64,
             lease_duration_ms: o.lease_duration.as_millis() as u64,
-            worker_id: o.worker_id,
+            worker_id: o.worker_id.clone(),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct ServerInfo {
+    pub version: String,
+    pub supported_protocol_versions: Vec<String>,
+    pub server_time: SystemTime,
+    pub allowed_encodings: Vec<String>,
+    pub max_payload_size: u64,
+    pub max_custom_entries: u32,
+    pub max_custom_total_bytes: u64,
+    pub max_custom_key_bytes: u32,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServerInfoError {
+    #[error("server info is missing required field `{0}`")]
+    MissingField(&'static str),
+    #[error("server_time_ms is not a representable time ({0}ms)")]
+    InvalidServerTime(i64),
+}
+
+impl TryFrom<crate::pb::sepp::v1::GetServerInfoResponse> for ServerInfo {
+    type Error = ServerInfoError;
+
+    fn try_from(r: crate::pb::sepp::v1::GetServerInfoResponse) -> Result<Self, Self::Error> {
+        if r.server_version.is_empty() {
+            return Err(ServerInfoError::MissingField("server_version"));
+        }
+        let server_time = millis_to_system_time(r.server_time_ms)
+            .ok_or(ServerInfoError::InvalidServerTime(r.server_time_ms))?;
+
+        Ok(Self {
+            version: r.server_version,
+            supported_protocol_versions: r.supported_protocol_versions,
+            server_time,
+            allowed_encodings: r.allowed_encodings,
+            max_payload_size: r.max_payload_bytes,
+            max_custom_entries: r.max_custom_entries,
+            max_custom_total_bytes: r.max_custom_total_bytes,
+            max_custom_key_bytes: r.max_custom_key_bytes,
+        })
     }
 }

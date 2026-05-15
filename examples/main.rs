@@ -1,33 +1,85 @@
-use std::collections::HashMap;
+//! End-to-end roundtrip: enqueue one job, then run a worker that processes it.
+//!
+//! Requires a running Sepp server. Point at it with `SEPP_ADDR`
+//! (default `http://127.0.0.1:50051`):
+//!
+//!     cargo run --example main
 
-use sepp_rs::pb::sepp::v1::{
-    EnqueueBatchRequest, EnqueueRequest, PrimitiveValue, primitive_value,
-    queue_service_client::QueueServiceClient,
-};
+use std::time::Duration;
+
+use sepp_rs::client::SeppClient;
+use sepp_rs::worker::Worker;
+use sepp_rs::{EnqueueRequest, Payload, ReserveOptions};
+
+const QUEUE: &str = "example";
+const JOB_TYPE: &str = "greeting";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "http://127.0.0.1:50051".into());
-    let mut client = QueueServiceClient::connect(addr).await?;
-    let info = client
-        .enqueue_batch(EnqueueBatchRequest {
-            jobs: vec![EnqueueRequest {
-                queue: "123".to_string(),
-                job_type: "asdf".to_string(),
-                custom: HashMap::from([(
-                    "int_value".to_string(),
-                    PrimitiveValue {
-                        value: Some(primitive_value::Value::IntValue(9_007_199_254_740_993)),
-                    },
-                )]),
-                ..Default::default()
-            }],
-        })
-        .await?
-        .into_inner();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,sepp_rs=debug")),
+        )
+        .init();
 
-    //println!("{info:#?}");
-    Ok(())
+    let addr = std::env::var("SEPP_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+    let client = SeppClient::connect(addr).await?;
+
+    // 1. Enqueue a single job.
+    let job = EnqueueRequest::new(QUEUE, JOB_TYPE)?.with_payload(Payload {
+        data: b"hello, sepp".to_vec(),
+        encoding: "text/plain".to_string(),
+    });
+
+    match client.enqueue(job).await? {
+        Ok(ack) => println!(
+            "enqueued job {} (deduplicated={})",
+            ack.job_id, ack.deduplicated
+        ),
+        Err(rej) => {
+            return Err(format!("server rejected the job: {} — {}", rej.code, rej.message).into());
+        }
+    }
+
+    // 2. Launch a worker. The handler sends the job id back over a channel so
+    //    the example can finish instead of looping in `run` forever.
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<String>(1);
+
+    let opts = ReserveOptions::new([QUEUE], Duration::from_secs(30))?;
+    let worker = Worker::new(client.clone(), opts).handle(JOB_TYPE, move |payload, ctx| {
+        let done_tx = done_tx.clone();
+        async move {
+            let body = payload
+                .map(|p| String::from_utf8_lossy(&p.data).into_owned())
+                .unwrap_or_default();
+            println!("worker: processing job {} — payload {body:?}", ctx.id);
+            let _ = done_tx.send(ctx.id.clone()).await;
+            Ok(())
+        }
+    });
+
+    let worker_task = tokio::spawn(worker.run());
+
+    // 3. Wait for the job to be processed, with a timeout.
+    let processed = tokio::time::timeout(Duration::from_secs(15), done_rx.recv()).await;
+
+    match processed {
+        Ok(Some(id)) => {
+            // Give the worker a moment to ack before tearing it down, so the
+            // job is not redelivered on the next run.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            worker_task.abort();
+            println!("roundtrip OK — job {id} was enqueued and processed");
+            Ok(())
+        }
+        Ok(None) => {
+            worker_task.abort();
+            Err("worker stopped before processing the job".into())
+        }
+        Err(_) => {
+            worker_task.abort();
+            Err("timed out waiting for the job to be processed".into())
+        }
+    }
 }
