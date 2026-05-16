@@ -193,6 +193,18 @@ impl SeppClient {
         Ok(response.dead_lettered)
     }
 
+    #[tracing::instrument(skip_all, level = "debug", fields(job_id = %ctx.id, attempt = ctx.attempt))]
+    pub async fn extend(&self, ctx: &JobCtx, extension: Duration) -> Result<(), ClientError> {
+        let request = Request::new(pb::ExtendRequest {
+            job_id: ctx.id.clone(),
+            attempt: ctx.attempt,
+            lease_duration_ms: extension.as_millis() as u64,
+        });
+
+        self.inner.clone().extend(request).await?;
+        Ok(())
+    }
+
     pub async fn get_server_info(&self) -> Result<ServerInfo, ClientError> {
         let request = Request::new(pb::GetServerInfoRequest {});
         let response = self
