@@ -139,16 +139,21 @@ impl SeppClient {
     }
 
     #[tracing::instrument(skip_all, level = "debug")]
-    pub async fn reserve(&self, opts: &ReserveOptions) -> Result<Option<Job>, ClientError> {
+    pub async fn reserve(&self, opts: &ReserveOptions) -> Result<Option<Vec<Job>>, ClientError> {
         let mut request = Request::new(pb::ReserveRequest::from(opts));
         request.set_timeout(opts.wait_timeout() + RESERVE_DEADLINE_SLACK);
 
         let response = self.inner.clone().reserve(request).await?.into_inner();
 
-        match response.job {
-            Some(job) => Ok(Some(Job::try_from(job)?)),
-            None => Ok(None),
+        if response.jobs.is_empty() {
+            return Ok(None);
         }
+        let jobs = response
+            .jobs
+            .into_iter()
+            .map(Job::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(jobs))
     }
 
     #[tracing::instrument(skip_all, level = "debug", fields(job_id = %ctx.id, attempt = ctx.attempt))]

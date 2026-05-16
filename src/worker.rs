@@ -102,8 +102,8 @@ impl Worker {
                 .await
                 .expect("semaphore is never closed");
 
-            let job = match self.client.reserve(&self.opts).await {
-                Ok(Some(job)) => job,
+            let jobs = match self.client.reserve(&self.opts).await {
+                Ok(Some(jobs)) => jobs,
                 Ok(None) => continue, // wait window elapsed — re-poll immediately
                 Err(_err) => {
                     warn!(
@@ -115,12 +115,29 @@ impl Worker {
                 }
             };
 
-            let client = self.client.clone();
-            let handlers = Arc::clone(&handlers);
-            tokio::spawn(async move {
-                let _permit = permit; // held for the job's lifetime, released on completion
-                process_job(&client, &handlers, job).await;
-            });
+            let mut jobs = jobs.into_iter();
+            let Some(first) = jobs.next() else { continue };
+            {
+                let client = self.client.clone();
+                let handlers = Arc::clone(&handlers);
+                tokio::spawn(async move {
+                    let _permit = permit; // held for the job's lifetime
+                    process_job(&client, &handlers, first).await;
+                });
+            }
+            for job in jobs {
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore is never closed");
+                let client = self.client.clone();
+                let handlers = Arc::clone(&handlers);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    process_job(&client, &handlers, job).await;
+                });
+            }
         }
     }
 }

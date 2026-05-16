@@ -530,6 +530,7 @@ pub struct ReserveOptions {
     wait_timeout: Duration,
     lease_duration: Duration,
     worker_id: Option<String>,
+    max_jobs: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -566,6 +567,7 @@ impl ReserveOptions {
             wait_timeout: Duration::from_secs(30), // The server will hold the connection open for this long if no job is immediately available
             lease_duration,
             worker_id: None,
+            max_jobs: None,
         })
     }
 
@@ -586,6 +588,11 @@ impl ReserveOptions {
         self.worker_id = Some(id);
         Ok(self)
     }
+
+    pub fn with_max_jobs(mut self, max: u32) -> Self {
+        self.max_jobs = Some(max);
+        self
+    }
 }
 
 impl From<ReserveOptions> for crate::pb::sepp::v1::ReserveRequest {
@@ -601,6 +608,7 @@ impl From<&ReserveOptions> for crate::pb::sepp::v1::ReserveRequest {
             wait_timeout_ms: o.wait_timeout.as_millis() as u64,
             lease_duration_ms: o.lease_duration.as_millis() as u64,
             worker_id: o.worker_id.clone(),
+            max_jobs: o.max_jobs,
         }
     }
 }
