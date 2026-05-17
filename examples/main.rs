@@ -15,7 +15,14 @@ const QUEUE: &str = "example";
 const JOB_TYPE: &str = "greeting";
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

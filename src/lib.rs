@@ -26,7 +26,7 @@ impl From<Primitive> for crate::pb::sepp::v1::PrimitiveValue {
             Primitive::Double(d) => Value::DoubleValue(d),
             Primitive::Bool(b) => Value::BoolValue(b),
         };
-        Self { value: Some(value) } // ← wrap, then put Some around it
+        Self { value: Some(value) }
     }
 }
 
@@ -145,7 +145,7 @@ impl TraceContext {
 #[cfg(feature = "opentelemetry")]
 impl TraceContext {
     pub fn from_current_otel() -> Option<Self> {
-        use opentelemetry::propagation::{Injector, TextMapPropagator};
+        use opentelemetry::propagation::TextMapPropagator;
         use opentelemetry::trace::TraceContextExt;
         use opentelemetry_sdk::propagation::TraceContextPropagator;
 
@@ -177,6 +177,64 @@ impl TraceContext {
 
         let extracted = TraceContextPropagator::new().extract(&HashMapExtractor(&carrier));
         extracted.attach()
+    }
+
+    pub fn otel_span_context(&self) -> Option<opentelemetry::trace::SpanContext> {
+        use opentelemetry::propagation::TextMapPropagator;
+        use opentelemetry::trace::TraceContextExt;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+        let mut carrier = HashMap::new();
+        carrier.insert("traceparent".to_string(), self.traceparent.clone());
+        if let Some(ts) = &self.tracestate {
+            carrier.insert("tracestate".to_string(), ts.clone());
+        }
+        let cx = TraceContextPropagator::new().extract(&HashMapExtractor(&carrier));
+        let span_context = cx.span().span_context().clone();
+        span_context.is_valid().then_some(span_context)
+    }
+}
+
+#[cfg(feature = "opentelemetry")]
+pub(crate) fn inject_pb_trace_context(
+    cx: &opentelemetry::Context,
+) -> Option<crate::pb::sepp::v1::TraceContext> {
+    use opentelemetry::propagation::TextMapPropagator;
+    use opentelemetry::trace::TraceContextExt;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+    if !cx.span().span_context().is_valid() {
+        return None;
+    }
+    let mut carrier = HashMap::new();
+    TraceContextPropagator::new().inject_context(cx, &mut HashMapInjector(&mut carrier));
+    Some(crate::pb::sepp::v1::TraceContext {
+        traceparent: carrier.remove("traceparent")?,
+        tracestate: carrier.remove("tracestate"),
+    })
+}
+
+#[cfg(feature = "opentelemetry")]
+struct HashMapInjector<'a>(&'a mut HashMap<String, String>);
+
+#[cfg(feature = "opentelemetry")]
+impl opentelemetry::propagation::Injector for HashMapInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_string(), value);
+    }
+}
+
+#[cfg(feature = "opentelemetry")]
+struct HashMapExtractor<'a>(&'a HashMap<String, String>);
+
+#[cfg(feature = "opentelemetry")]
+impl opentelemetry::propagation::Extractor for HashMapExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(String::as_str).collect()
     }
 }
 
@@ -524,7 +582,7 @@ impl TryFrom<crate::pb::sepp::v1::Job> for Job {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReserveOptions {
     queues: Vec<String>,
     wait_timeout: Duration,

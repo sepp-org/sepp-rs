@@ -1,0 +1,325 @@
+syntax = "proto3";
+
+package sepp.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/empty.proto";
+
+// ============================================================================
+// Service definitions
+// ============================================================================
+
+service QueueService {
+    // Batch enqueue. Atomic per-batch: either all jobs are enqueued or none are.
+    rpc EnqueueBatch(EnqueueBatchRequest) returns (EnqueueBatchResponse);
+
+    // Long-poll reserve. Returns one job or times out.
+    rpc Reserve(ReserveRequest) returns (ReserveResponse);
+
+    // Acknowledge successful completion of a job.
+    rpc Ack(AckRequest) returns (AckResponse);
+
+    // Negative-acknowledge with retry directive.
+    rpc Nack(NackRequest) returns (NackResponse);
+
+    // Extend the lease on an in-flight job.
+    rpc Extend(ExtendRequest) returns (ExtendResponse);
+
+    // Get server info and capabilities.
+    rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+}
+
+// ============================================================================
+// Common types
+// ============================================================================
+
+// A JSON-primitive value, for use in the custom value map.
+message PrimitiveValue {
+    oneof value {
+        option (buf.validate.oneof).required = true;
+
+        string string_value = 1;
+        double double_value = 2;
+
+        // SDKs must string encode this because JavaScript sucks.
+        // JavaScript Number is f64 and loses precision above 2^53.
+        int64 int_value = 3;
+
+        bool bool_value = 4;
+    }
+}
+
+// Trace context for distributed tracing.
+message TraceContext {
+    // W3C traceparent header value.
+    string traceparent = 1 [(buf.validate.field).string.min_len = 1];
+
+    // W3C tracestate header value (vendor-specific trace info).
+    optional string tracestate = 2;
+}
+
+// Carries payload bytes and the encoding hint.
+message Payload {
+    bytes data = 1 [(buf.validate.field).bytes.min_len = 1];
+    string encoding = 2 [(buf.validate.field).string.min_len = 1];
+}
+
+// A job ready for a worker to process. Returned by Reserve and ReserveStream.
+message Job {
+    // Server-assigned job ID (UUID).
+    string id = 1 [(buf.validate.field).string.uuid = true];
+
+    // Type tag the producer set when enqueueing.
+    string job_type = 2 [(buf.validate.field).string.min_len = 1];
+
+    // Opaque payload with encoding hint for the worker.
+    optional Payload payload = 3;
+
+    // Producer-set priority. 0 is lowest, 9 is highest.
+    uint32 priority = 4 [(buf.validate.field).uint32.lte = 9];
+
+    // Trace context for tracing continuation.
+    optional TraceContext trace_context = 5;
+
+    // Wall-clock time when the producer enqueued this job. Milliseconds
+    // since Unix epoch UTC.
+    int64 enqueued_at = 6 [(buf.validate.field).int64.gt = 0];
+
+    // Which attempt at this job this delivery pertains to. 1 on first delivery, incremented on each redelivery.
+    uint32 attempt = 7 [(buf.validate.field).uint32.gte = 1];
+
+    // How many attempts are allowed before this job goes to dead-letter.
+    uint32 max_attempts = 8 [(buf.validate.field).uint32.gte = 1];
+
+    // Wall-clock time when the lease on this job expires. Milliseconds since Unix epoch UTC.
+    // If the worker has not acked/nacked/extended by this time, the job becomes available for redelivery.
+    int64 lease_expires_at = 9 [(buf.validate.field).int64.gt = 1];
+
+    // Custom key-value pairs.
+    map<string, PrimitiveValue> custom = 10 [(buf.validate.field).map = {
+        keys: { string: { min_len: 1 } }
+    }];
+
+    // Schedule for future execution. If unset, the job is available immediately.
+    optional int64 scheduled_at = 11 [(buf.validate.field).int64.gt = 0];
+}
+
+// Error details for failed requests. Returned in gRPC status details
+// where applicable.
+message ErrorDetails {
+    string code = 1 [(buf.validate.field).string.min_len = 1];
+    string message = 2 [(buf.validate.field).string.min_len = 1];
+
+    // Structured details specific to the code.
+    map<string, string> context = 3;
+}
+
+// ============================================================================
+// Enqueue
+// ============================================================================
+
+// Enqueue a job for processing.
+message EnqueueRequest {
+    // Target queue.
+    string queue = 1 [(buf.validate.field).string.min_len = 1];
+
+    // Type tag for worker-side dispatch.
+    string job_type = 2 [(buf.validate.field).string.min_len = 1];
+
+    // Opaque payload with encoding hint for the worker.
+    optional Payload payload = 3;
+
+    // Deduplication key. The server rejects duplicate enqueues
+    // with the same key within the queue's dedup window.
+    optional string idempotency_key = 4 [(buf.validate.field).string.min_len = 1];
+
+    // Priority override. If unset, the queue default is used.
+    // Range: 0–9. Higher priorities dequeue first.
+    optional uint32 priority = 5 [(buf.validate.field).uint32.lte = 9];
+
+    // Max attempts override. If unset, the queue default is used.
+    optional uint32 max_attempts = 6 [(buf.validate.field).uint32.gte = 1];
+
+    // Trace context from the producer.
+    optional TraceContext trace_context = 7;
+
+    // Custom key-value pairs.
+    map<string, PrimitiveValue> custom = 8 [(buf.validate.field).map = {
+        keys: { string: { min_len: 1 } }
+    }];
+
+    // Schedule for future execution. If unset, the job is available immediately.
+    optional int64 scheduled_at = 9 [(buf.validate.field).int64.gt = 0];
+}
+
+// Response for an EnqueueRequest. Contains the assigned job ID and whether this was a duplicate.
+// Mostly useful for logging on the producer side.
+message EnqueueResponse {
+    // Server-assigned job ID (UUID).
+    string job_id = 1 [(buf.validate.field).string.uuid = true];
+
+    // True if this enqueue was deduplicated (job_id refers to the existing job).
+    bool deduplicated = 2;
+}
+
+// Batch enqueue request and response.
+message EnqueueBatchRequest {
+    // Jobs to enqueue.
+    repeated EnqueueRequest jobs = 1 [(buf.validate.field).repeated.min_items = 1];
+}
+
+// Response for an EnqueueBatchRequest. One result per request job, same order.
+message EnqueueBatchResponse {
+    repeated JobResult results = 1 [(buf.validate.field).repeated.min_items = 1];
+}
+
+// Outcome of a single job in the batch.
+message JobResult {
+    oneof outcome {
+        option (buf.validate.oneof).required = true;
+
+        // The job was enqueued.
+        EnqueueResponse success = 1;
+
+        // The job was rejected (e.g. unknown queue).
+        ErrorDetails error = 2;
+    }
+}
+
+
+// ============================================================================
+// Reserve (unary)
+// ============================================================================
+
+// Worker requests a single job in a long polling manner.
+message ReserveRequest {
+    // Queues to pull from. Worker is willing to process jobs from any of these.
+    // If multiple are listed, the server picks based on priority and availability.
+    repeated string queues = 1 [(buf.validate.field).repeated = {
+        min_items: 1,
+        items: { string: { min_len: 1 } }
+    }];
+
+    // How long the worker is willing to wait for a job, in milliseconds.
+    // If no job is available within this window, the response has no job.
+    uint64 wait_timeout_ms = 2;
+
+    // Lease duration the worker wants. Server may clamp to its configured max.
+    // The worker must ack, nack, or extend before this time elapses, or the
+    // job will be redelivered.
+    uint64 lease_duration_ms = 3 [(buf.validate.field).uint64.gte = 1];
+
+    // A stable worker identifier, useful for observability and
+    // sticky-routing future features.
+    optional string worker_id = 4 [(buf.validate.field).string.min_len = 1];
+
+    optional uint32 max_jobs = 5 [(buf.validate.field).uint32.gte = 1]; 
+}
+
+// Zero or one job. Empty when the wait timeout fires with no job available.
+message ReserveResponse {
+    repeated Job jobs = 1;
+}
+
+// ============================================================================
+// Ack / Nack / Extend
+// ============================================================================
+
+message AckRequest {
+    string job_id = 1 [(buf.validate.field).string.uuid = true];
+
+    // The attempt for which this ack applies. Used to prevent acking a job that has been redelivered.
+    uint32 attempt = 2 [(buf.validate.field).uint32.gte = 1];
+
+    // Worker identifier for observability.
+    optional string worker_id = 3 [(buf.validate.field).string.min_len = 1];
+}
+
+message AckResponse {
+    string job_id = 1 [(buf.validate.field).string.uuid = true];
+}
+
+message NackRequest {
+    string job_id = 1 [(buf.validate.field).string.uuid = true];
+
+    // The attempt for which this nack applies. Used to prevent nacking a job that has been redelivered.
+    uint32 attempt = 2 [(buf.validate.field).uint32.gte = 1];
+
+    // Human-readable reason, captured for debugging and metrics.
+    optional string reason = 3;
+
+    // Explicit retry behavior.
+    optional NackRetry retry = 4;
+
+    // Worker identifier for observability.
+    optional string worker_id = 5 [(buf.validate.field).string.min_len = 1];
+}
+
+message NackRetry {
+    oneof strategy {
+        option (buf.validate.oneof).required = true;
+
+        // Use the queue's default retry policy.
+        google.protobuf.Empty default = 1;
+
+        // Retry after this many milliseconds.
+        uint64 delay_ms = 2;
+
+        // Don't retry; move directly to dead-letter.
+        google.protobuf.Empty dead_letter = 3;
+    }
+}
+
+message NackResponse {
+    string job_id = 1 [(buf.validate.field).string.uuid = true];
+
+    // True if this nack moved the job to dead-letter (e.g. max attempts reached).
+    bool dead_lettered = 2;
+}
+
+message ExtendRequest {
+    string job_id = 1 [(buf.validate.field).string.uuid = true];
+
+    // The attempt for which this extend applies. Used to prevent extending a job that has been redelivered.
+    uint32 attempt = 2 [(buf.validate.field).uint32.gte = 1];
+
+    // How much longer to extend the lease, in milliseconds, measured from now.
+    uint64 lease_duration_ms = 3 [(buf.validate.field).uint64.gt = 0];
+
+    // Worker identifier for observability.
+    optional string worker_id = 4 [(buf.validate.field).string.min_len = 1];
+}
+
+message ExtendResponse {
+    string job_id = 1 [(buf.validate.field).string.uuid = true];
+
+    // New lease expiration. Milliseconds since Unix epoch UTC.
+    int64 lease_expires_at = 2 [(buf.validate.field).int64.gt = 0];
+}
+
+// ============================================================================
+// Server info
+// ============================================================================
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+    // Server version (semver string).
+    string server_version = 1 [(buf.validate.field).string.min_len = 1];
+
+    // Protocol versions supported by this server.
+    repeated string supported_protocol_versions = 2 [(buf.validate.field).repeated = {
+        min_items: 1,
+        items: { string: { min_len: 1 } }
+    }];
+
+    // Server-side time, milliseconds since Unix epoch UTC. Useful for clients
+    // to detect clock skew.
+    int64 server_time_ms = 3 [(buf.validate.field).int64.gt = 0];
+
+    repeated string allowed_encodings = 4;
+    uint64 max_payload_bytes = 5;
+    uint32 max_custom_entries = 6;
+    uint64 max_custom_total_bytes = 7;
+    uint32 max_custom_key_bytes = 8;
+}

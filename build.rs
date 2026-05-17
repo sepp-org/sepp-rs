@@ -1,38 +1,22 @@
-use std::path::PathBuf;
-use std::process::Command;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
     }
 
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
-    let remote_dir = out_dir.join("proto_remote");
+    // Proto files are vendored into `proto/` (committed to the repo, shipped in
+    // the published crate). To refresh them after an upstream change, run:
+    //
+    //     buf export buf.build/sepp-org/sepp-proto -o proto
+    //
+    // The build itself never invokes `buf` or touches the network, so it works
+    // on docs.rs, in offline CI, and for anyone who `cargo add`s this crate.
+    let includes = &["proto"];
+    let protos = &["proto/queue.proto"];
 
-    if remote_dir.exists() {
-        std::fs::remove_dir_all(&remote_dir)?;
+    for proto in protos {
+        println!("cargo:rerun-if-changed={proto}");
     }
-    std::fs::create_dir_all(&remote_dir)?;
-
-    for module in [
-        "buf.build/sepp-org/sepp-proto",
-        "buf.build/bufbuild/protovalidate",
-    ] {
-        let status = Command::new("buf")
-            .args(["export", module, "-o"])
-            .arg(&remote_dir)
-            .status()?;
-        if !status.success() {
-            return Err(format!("buf export {module} failed").into());
-        }
-    }
-
-    println!("cargo:rerun-if-changed=buf.lock");
-    println!("cargo:rerun-if-changed=buf.yaml");
-
-    let remote_dir_str = remote_dir.to_str().ok_or("non-utf8 OUT_DIR")?.to_string();
-    let includes = &["proto", remote_dir_str.as_str()];
-    let protos = &["queue.proto"];
+    println!("cargo:rerun-if-changed=proto/buf/validate/validate.proto");
 
     let mut prost_config = prost_build::Config::new();
 
