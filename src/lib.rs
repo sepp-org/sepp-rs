@@ -469,6 +469,16 @@ pub struct JobCtx {
     pub custom: HashMap<String, Primitive>,
     pub trace_context: Option<TraceContext>,
     pub lease_expires_at: SystemTime,
+    pub(crate) lease: crate::client::Lease,
+}
+
+impl JobCtx {
+    pub async fn extend(
+        &self,
+        extension: Duration,
+    ) -> Result<SystemTime, crate::client::ClientError> {
+        self.lease.extend(extension).await
+    }
 }
 
 #[derive(Debug)]
@@ -525,61 +535,74 @@ fn millis_to_system_time(ms: i64) -> Option<SystemTime> {
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms))
 }
 
-impl TryFrom<crate::pb::sepp::v1::Job> for Job {
-    type Error = JobConversionError;
+pub(crate) fn system_time_to_millis(t: SystemTime) -> i64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
-    fn try_from(j: crate::pb::sepp::v1::Job) -> Result<Self, Self::Error> {
-        use JobConversionError as E;
+pub(crate) fn now_millis() -> i64 {
+    system_time_to_millis(SystemTime::now())
+}
 
-        if j.id.is_empty() {
-            return Err(E::MissingField("id"));
-        }
-        if j.job_type.is_empty() {
-            return Err(E::MissingField("job_type"));
-        }
+pub(crate) fn job_from_pb(
+    client: &crate::client::SeppClient,
+    j: crate::pb::sepp::v1::Job,
+) -> Result<Job, JobConversionError> {
+    use JobConversionError as E;
 
-        let priority = u8::try_from(j.priority)
-            .ok()
-            .and_then(|p| Priority::new(p).ok())
-            .ok_or(E::PriorityOutOfRange(j.priority))?;
-
-        let enqueued_at = millis_to_system_time(j.enqueued_at).ok_or(E::InvalidTimestamp {
-            field: "enqueued_at",
-            value: j.enqueued_at,
-        })?;
-        let lease_expires_at =
-            millis_to_system_time(j.lease_expires_at).ok_or(E::InvalidTimestamp {
-                field: "lease_expires_at",
-                value: j.lease_expires_at,
-            })?;
-
-        let mut custom = HashMap::with_capacity(j.custom.len());
-        for (k, v) in j.custom {
-            let value = primitive_from_pb(v).ok_or_else(|| E::EmptyCustomValue(k.clone()))?;
-            custom.insert(k, value);
-        }
-
-        // An invalid trace context must not block job delivery: drop it and
-        // lose trace continuity rather than failing the whole reservation.
-        let trace_context = j
-            .trace_context
-            .and_then(|tc| TraceContext::try_from(tc).ok());
-
-        Ok(Job {
-            payload: j.payload.map(Into::into),
-            ctx: JobCtx {
-                id: j.id,
-                job_type: j.job_type,
-                priority,
-                attempt: j.attempt,
-                max_attempts: j.max_attempts,
-                enqueued_at,
-                custom,
-                trace_context,
-                lease_expires_at,
-            },
-        })
+    if j.id.is_empty() {
+        return Err(E::MissingField("id"));
     }
+    if j.job_type.is_empty() {
+        return Err(E::MissingField("job_type"));
+    }
+
+    let priority = u8::try_from(j.priority)
+        .ok()
+        .and_then(|p| Priority::new(p).ok())
+        .ok_or(E::PriorityOutOfRange(j.priority))?;
+
+    let enqueued_at = millis_to_system_time(j.enqueued_at).ok_or(E::InvalidTimestamp {
+        field: "enqueued_at",
+        value: j.enqueued_at,
+    })?;
+    let lease_expires_at =
+        millis_to_system_time(j.lease_expires_at).ok_or(E::InvalidTimestamp {
+            field: "lease_expires_at",
+            value: j.lease_expires_at,
+        })?;
+
+    let mut custom = HashMap::with_capacity(j.custom.len());
+    for (k, v) in j.custom {
+        let value = primitive_from_pb(v).ok_or_else(|| E::EmptyCustomValue(k.clone()))?;
+        custom.insert(k, value);
+    }
+
+    // An invalid trace context must not block job delivery: drop it and
+    // lose trace continuity rather than failing the whole reservation.
+    let trace_context = j
+        .trace_context
+        .and_then(|tc| TraceContext::try_from(tc).ok());
+
+    let lease =
+        crate::client::Lease::new(client.clone(), j.id.clone(), j.attempt, lease_expires_at);
+
+    Ok(Job {
+        payload: j.payload.map(Into::into),
+        ctx: JobCtx {
+            id: j.id,
+            job_type: j.job_type,
+            priority,
+            attempt: j.attempt,
+            max_attempts: j.max_attempts,
+            enqueued_at,
+            custom,
+            trace_context,
+            lease_expires_at,
+            lease,
+        },
+    })
 }
 
 #[derive(Debug, Clone)]

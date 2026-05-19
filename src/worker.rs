@@ -1,12 +1,13 @@
 use std::{collections::HashMap, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use futures::{FutureExt, future::BoxFuture};
-use tokio::sync::Semaphore;
+use tokio::{sync::Semaphore, task::AbortHandle};
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
     Job, JobCtx, Payload, ReserveOptions,
-    client::{ClientError, RetryDirective, SeppClient},
+    client::{ClientError, Lease, RetryDirective, SeppClient},
+    now_millis,
 };
 
 type Handler = Arc<
@@ -43,6 +44,13 @@ pub struct Worker {
     handlers: HashMap<String, Handler>,
     max_in_flight: usize,
     reserve_error_backoff: Duration,
+    auto_extend: Option<AutoExtend>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AutoExtend {
+    interval: Duration,
+    extend_by: Duration,
 }
 
 impl Worker {
@@ -58,7 +66,26 @@ impl Worker {
             handlers: HashMap::new(),
             max_in_flight: 16,
             reserve_error_backoff: Duration::from_secs(1),
+            auto_extend: None,
         }
+    }
+
+    pub fn with_auto_extend(mut self) -> Self {
+        let lease = self.opts.lease_duration;
+        self.auto_extend = Some(AutoExtend {
+            interval: heartbeat_interval(lease),
+            extend_by: lease,
+        });
+        self
+    }
+
+    pub fn with_auto_extend_interval(mut self, interval: Duration) -> Self {
+        let lease = self.opts.lease_duration;
+        self.auto_extend = Some(AutoExtend {
+            interval: interval.max(Duration::from_millis(1)),
+            extend_by: lease,
+        });
+        self
     }
 
     pub fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
@@ -92,10 +119,12 @@ impl Worker {
     pub async fn run(self) -> Result<(), ClientError> {
         let semaphore = Arc::new(Semaphore::new(self.max_in_flight.max(1)));
         let handlers = Arc::new(self.handlers);
+        let auto_extend = self.auto_extend;
         info!(
             worker_id = self.client.worker_id().unwrap_or("<none>"),
             max_in_flight = self.max_in_flight,
             handlers = handlers.len(),
+            auto_extend = auto_extend.is_some(),
             "worker started"
         );
 
@@ -132,7 +161,7 @@ impl Worker {
                 let handlers = Arc::clone(&handlers);
                 tokio::spawn(async move {
                     let _permit = permit; // held for the job's lifetime
-                    process_job(&client, &handlers, first).await;
+                    process_job(&client, &handlers, auto_extend, first).await;
                 });
             }
             for job in jobs {
@@ -145,14 +174,19 @@ impl Worker {
                 let handlers = Arc::clone(&handlers);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    process_job(&client, &handlers, job).await;
+                    process_job(&client, &handlers, auto_extend, job).await;
                 });
             }
         }
     }
 }
 
-async fn process_job(client: &SeppClient, handlers: &HashMap<String, Handler>, job: Job) {
+async fn process_job(
+    client: &SeppClient,
+    handlers: &HashMap<String, Handler>,
+    auto_extend: Option<AutoExtend>,
+    job: Job,
+) {
     let span = tracing::info_span!(
         "sepp-rs.process",
         job_id = %job.ctx.id,
@@ -171,11 +205,19 @@ async fn process_job(client: &SeppClient, handlers: &HashMap<String, Handler>, j
         span.add_link(link);
     }
 
-    run_job(client, handlers, job).instrument(span).await
+    run_job(client, handlers, auto_extend, job)
+        .instrument(span)
+        .await
 }
 
-async fn run_job(client: &SeppClient, handlers: &HashMap<String, Handler>, job: Job) {
+async fn run_job(
+    client: &SeppClient,
+    handlers: &HashMap<String, Handler>,
+    auto_extend: Option<AutoExtend>,
+    job: Job,
+) {
     let Job { payload, ctx } = job;
+    let lease = ctx.lease.clone();
     let ctx = Arc::new(ctx);
 
     let Some(handler) = handlers.get(&ctx.job_type) else {
@@ -191,36 +233,91 @@ async fn run_job(client: &SeppClient, handlers: &HashMap<String, Handler>, job: 
         return;
     };
 
-    let outcome = AssertUnwindSafe(handler(payload, Arc::clone(&ctx)))
-        .catch_unwind()
-        .await;
+    let fut = handler(payload, Arc::clone(&ctx));
 
-    let result = match outcome {
-        Ok(Ok(())) => {
-            debug!("job completed; acking");
-            client.ack(&ctx).await.map(drop)
+    let disposition = match auto_extend {
+        None => match AssertUnwindSafe(fut).catch_unwind().await {
+            Ok(result) => Disposition::Completed(result),
+            Err(_panic) => Disposition::Panicked,
+        },
+        Some(cfg) => {
+            let handler_task = tokio::spawn(fut);
+            let abort = handler_task.abort_handle();
+            let heartbeat_task = tokio::spawn(heartbeat(lease, cfg, abort));
+
+            let joined = handler_task.await;
+            heartbeat_task.abort(); // handler finished — stop extending
+
+            match joined {
+                Ok(result) => Disposition::Completed(result),
+                Err(err) if err.is_cancelled() => {
+                    error!("lease lost; handler aborted");
+                    return;
+                }
+                Err(_panic) => Disposition::Panicked,
+            }
         }
-        Ok(Err(err)) => {
+    };
+
+    if let Err(err) = dispose(client, &ctx, disposition).await {
+        error!("failed to ack/nack job; it will be redelivered after lease expiry: {err}");
+    }
+}
+
+enum Disposition {
+    Completed(Result<(), WorkerError>),
+    Panicked,
+}
+
+async fn dispose(
+    client: &SeppClient,
+    ctx: &JobCtx,
+    disposition: Disposition,
+) -> Result<(), ClientError> {
+    match disposition {
+        Disposition::Completed(Ok(())) => {
+            debug!("job completed; acking");
+            client.ack(ctx).await.map(drop)
+        }
+        Disposition::Completed(Err(err)) => {
             warn!("handler returned error; nacking: {err}");
             let (retry, reason) = match err {
                 WorkerError::Retry(r) => (RetryDirective::Default, r),
                 WorkerError::RetryAfter(r, d) => (RetryDirective::After(d), r),
                 WorkerError::Permanent(r) => (RetryDirective::DeadLetter, r),
             };
-            client.nack(&ctx, retry, reason).await.map(drop)
+            client.nack(ctx, retry, reason).await.map(drop)
         }
-        Err(_panic) => {
+        Disposition::Panicked => {
             error!("handler panicked; nacking");
             client
-                .nack(&ctx, RetryDirective::Default, "handler panicked")
+                .nack(ctx, RetryDirective::Default, "handler panicked")
                 .await
                 .map(drop)
         }
-    };
-
-    if let Err(err) = result {
-        error!("failed to ack/nack job; it will be redelivered after lease expiry: {err}");
     }
+}
+
+async fn heartbeat(lease: Lease, cfg: AutoExtend, handler: AbortHandle) {
+    loop {
+        tokio::time::sleep(cfg.interval).await;
+
+        match lease.extend(cfg.extend_by).await {
+            Ok(expiry) => debug!(?expiry, "lease extended"),
+            Err(err) => {
+                if now_millis() >= lease.known_expiry_ms() {
+                    error!("lease lost ({err}); aborting handler to avoid double processing");
+                    handler.abort();
+                    return;
+                }
+                warn!("lease extend failed ({err}); lease still valid, will retry");
+            }
+        }
+    }
+}
+
+fn heartbeat_interval(lease: Duration) -> Duration {
+    (lease / 3).max(Duration::from_millis(1))
 }
 
 fn default_worker_id() -> String {

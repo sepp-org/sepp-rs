@@ -1,5 +1,11 @@
 use crate::{EnqueueAck, JobRejection, ServerInfo, ServerInfoError, pb::sepp::v1 as pb};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::{Duration, SystemTime},
+};
 
 use tonic::{
     Request, Status,
@@ -165,11 +171,10 @@ impl SeppClient {
 
         let response = self.inner.clone().reserve(request).await?.into_inner();
 
-        // A single malformed job must not discard the rest of the batch: skip
-        // it (it redelivers after its lease expires) and deliver the good ones.
+        // A single malformed job must not discard the rest of the batch
         let mut jobs = Vec::with_capacity(response.jobs.len());
         for job in response.jobs {
-            match Job::try_from(job) {
+            match crate::job_from_pb(self, job) {
                 Ok(job) => jobs.push(job),
                 Err(e) => warn!(error = %e, "skipping malformed job in reserve response"),
             }
@@ -224,18 +229,37 @@ impl SeppClient {
         Ok(response.dead_lettered)
     }
 
-    #[tracing::instrument(name = "sepp-rs.extend", skip_all, fields(job_id = %ctx.id, attempt = ctx.attempt, worker_id = self.worker_id.as_deref().unwrap_or("<none>")))]
-    pub async fn extend(&self, ctx: &JobCtx, extension: Duration) -> Result<(), ClientError> {
+    pub async fn extend(
+        &self,
+        ctx: &JobCtx,
+        extension: Duration,
+    ) -> Result<SystemTime, ClientError> {
+        self.extend_inner(&ctx.id, ctx.attempt, extension).await
+    }
+
+    #[tracing::instrument(
+        name = "sepp-rs.extend",
+        skip_all,
+        fields(job_id = %job_id, attempt, worker_id = self.worker_id.as_deref().unwrap_or("<none>"))
+    )]
+    pub(crate) async fn extend_inner(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        extension: Duration,
+    ) -> Result<SystemTime, ClientError> {
         let mut request = Request::new(pb::ExtendRequest {
-            job_id: ctx.id.clone(),
-            attempt: ctx.attempt,
+            job_id: job_id.to_string(),
+            attempt,
             lease_duration_ms: extension.as_millis() as u64,
             worker_id: self.worker_id.clone(),
         });
         inject_metadata(&mut request);
 
-        self.inner.clone().extend(request).await?;
-        Ok(())
+        let response = self.inner.clone().extend(request).await?.into_inner();
+        crate::millis_to_system_time(response.lease_expires_at).ok_or(
+            ClientError::MalformedResponse("extend returned an invalid lease_expires_at"),
+        )
     }
 
     pub async fn get_server_info(&self) -> Result<ServerInfo, ClientError> {
@@ -248,6 +272,54 @@ impl SeppClient {
             .into_inner();
 
         Ok(ServerInfo::try_from(response)?)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Lease {
+    client: SeppClient,
+    job_id: String,
+    attempt: u32,
+    expiry: Arc<AtomicI64>,
+}
+
+impl Lease {
+    pub(crate) fn new(
+        client: SeppClient,
+        job_id: String,
+        attempt: u32,
+        lease_expires_at: SystemTime,
+    ) -> Self {
+        Self {
+            client,
+            job_id,
+            attempt,
+            expiry: Arc::new(AtomicI64::new(crate::system_time_to_millis(lease_expires_at))),
+        }
+    }
+
+    pub(crate) fn known_expiry_ms(&self) -> i64 {
+        self.expiry.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn extend(&self, by: Duration) -> Result<SystemTime, ClientError> {
+        let new_expiry = self
+            .client
+            .extend_inner(&self.job_id, self.attempt, by)
+            .await?;
+        self.expiry
+            .store(crate::system_time_to_millis(new_expiry), Ordering::Release);
+        Ok(new_expiry)
+    }
+}
+
+impl std::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field("job_id", &self.job_id)
+            .field("attempt", &self.attempt)
+            .field("known_expiry_ms", &self.known_expiry_ms())
+            .finish()
     }
 }
 
