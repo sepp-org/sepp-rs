@@ -2,9 +2,13 @@ use crate::{EnqueueAck, JobRejection, ServerInfo, ServerInfoError, pb::sepp::v1 
 use std::time::Duration;
 
 use tonic::{
-    Request,
+    Request, Status,
+    metadata::{Ascii, MetadataValue},
+    service::{Interceptor, interceptor::InterceptedService},
     transport::{Channel, Endpoint},
 };
+#[cfg(feature = "tls")]
+use tonic::transport::{Certificate, ClientTlsConfig};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -14,9 +18,11 @@ use crate::{
 
 const RESERVE_DEADLINE_SLACK: Duration = Duration::from_secs(10);
 
+type AuthChannel = InterceptedService<Channel, ApiKeyInterceptor>;
+
 #[derive(Clone)]
 pub struct SeppClient {
-    inner: QueueServiceClient<Channel>,
+    inner: QueueServiceClient<AuthChannel>,
     worker_id: Option<String>,
 }
 
@@ -29,6 +35,8 @@ const _: fn() = || {
 pub enum ClientError {
     #[error("could not connect to Sepp server at {addr}: {reason}")]
     Connect { addr: String, reason: String },
+    #[error("the API key is not a valid HTTP header value")]
+    InvalidApiKey,
     #[error("Internal RPC error: {0}")]
     Rpc(#[from] tonic::Status),
     #[error("Empty batch")]
@@ -51,39 +59,18 @@ pub enum RetryDirective {
 }
 
 impl SeppClient {
+    /// Connect to a Sepp server over plaintext with no authentication.
     pub async fn connect(addr: impl Into<String>) -> Result<Self, ClientError> {
-        let addr = addr.into();
-        let channel = async {
-            Endpoint::from_shared(addr.clone())?
-                .connect_timeout(Duration::from_secs(5))
-                .user_agent(concat!("sepp-rs/", env!("CARGO_PKG_VERSION")))? // So we can tell from the server POV which client this is
-                .http2_keep_alive_interval(Duration::from_secs(30)) // For streaming reserve
-                .keep_alive_timeout(Duration::from_secs(10)) // For streaming reserve
-                .keep_alive_while_idle(true) // For streaming reserve
-                .connect()
-                .await
-        }
-        .await
-        .map_err(|e| {
-            error!(%addr, error = %e, "failed to connect to Sepp server");
+        Self::builder(addr).connect().await
+    }
 
-            ClientError::Connect {
-                addr: addr.clone(),
-                reason: root_cause(&e),
-            }
-        })?;
-
-        info!(%addr, "connected to Sepp server");
-
-        Ok(Self {
-            inner: QueueServiceClient::new(channel),
-            worker_id: None,
-        })
+    pub fn builder(addr: impl Into<String>) -> SeppClientBuilder {
+        SeppClientBuilder::new(addr)
     }
 
     pub fn from_channel(channel: Channel) -> Self {
         Self {
-            inner: QueueServiceClient::new(channel),
+            inner: QueueServiceClient::with_interceptor(channel, ApiKeyInterceptor::disabled()),
             worker_id: None,
         }
     }
@@ -261,6 +248,151 @@ impl SeppClient {
             .into_inner();
 
         Ok(ServerInfo::try_from(response)?)
+    }
+}
+
+pub struct SeppClientBuilder {
+    addr: String,
+    api_key: Option<String>,
+    worker_id: Option<String>,
+    #[cfg(feature = "tls")]
+    tls: Option<ClientTlsConfig>,
+}
+
+impl SeppClientBuilder {
+    fn new(addr: impl Into<String>) -> Self {
+        Self {
+            addr: addr.into(),
+            api_key: None,
+            worker_id: None,
+            #[cfg(feature = "tls")]
+            tls: None,
+        }
+    }
+
+    pub fn api_key(mut self, key: impl Into<String>) -> Self {
+        self.api_key = Some(key.into());
+        self
+    }
+
+    pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
+        self.worker_id = Some(worker_id.into());
+        self
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn tls(mut self) -> Self {
+        self.tls = Some(self.tls.unwrap_or_default().with_native_roots());
+        self
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn tls_ca_certificate(mut self, pem: impl AsRef<[u8]>) -> Self {
+        let config = self.tls.unwrap_or_default();
+        self.tls = Some(config.ca_certificate(Certificate::from_pem(pem)));
+        self
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn tls_domain(mut self, domain: impl Into<String>) -> Self {
+        let config = self.tls.unwrap_or_default();
+        self.tls = Some(config.domain_name(domain));
+        self
+    }
+
+    #[cfg(feature = "tls")]
+    pub fn tls_config(mut self, config: ClientTlsConfig) -> Self {
+        self.tls = Some(config);
+        self
+    }
+
+    pub async fn connect(self) -> Result<SeppClient, ClientError> {
+        let addr = self.addr;
+        let interceptor =
+            ApiKeyInterceptor::new(self.api_key.as_deref()).ok_or(ClientError::InvalidApiKey)?;
+
+        #[cfg(feature = "tls")]
+        let tls = self.tls;
+        #[cfg(feature = "tls")]
+        let tls_enabled = tls.is_some();
+        #[cfg(not(feature = "tls"))]
+        let tls_enabled = false;
+
+        if interceptor.is_enabled() && !tls_enabled {
+            warn!("API key configured without TLS; it will be sent over the connection in plaintext");
+        }
+
+        let channel = async {
+            #[allow(unused_mut)]
+            let mut endpoint = Endpoint::from_shared(addr.clone())?
+                .connect_timeout(Duration::from_secs(5))
+                .user_agent(concat!("sepp-rs/", env!("CARGO_PKG_VERSION")))? // So we can tell from the server POV which client this is
+                .http2_keep_alive_interval(Duration::from_secs(30)) // For streaming reserve
+                .keep_alive_timeout(Duration::from_secs(10)) // For streaming reserve
+                .keep_alive_while_idle(true); // For streaming reserve
+            #[cfg(feature = "tls")]
+            if let Some(tls) = tls {
+                endpoint = endpoint.tls_config(tls)?;
+            }
+            endpoint.connect().await
+        }
+        .await
+        .map_err(|e| {
+            error!(%addr, error = %e, "failed to connect to Sepp server");
+
+            ClientError::Connect {
+                addr: addr.clone(),
+                reason: root_cause(&e),
+            }
+        })?;
+
+        info!(
+            %addr,
+            tls = tls_enabled,
+            auth = interceptor.is_enabled(),
+            "connected to Sepp server",
+        );
+
+        Ok(SeppClient {
+            inner: QueueServiceClient::with_interceptor(channel, interceptor),
+            worker_id: self.worker_id,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct ApiKeyInterceptor {
+    // Pre-rendered `Bearer <key>` header value; None disables the interceptor.
+    bearer: Option<MetadataValue<Ascii>>,
+}
+
+impl ApiKeyInterceptor {
+    /// Returns `None` if the key cannot form a valid HTTP header value.
+    fn new(api_key: Option<&str>) -> Option<Self> {
+        let bearer = match api_key {
+            Some(key) => Some(format!("Bearer {key}").parse().ok()?),
+            None => None,
+        };
+        Some(Self { bearer })
+    }
+
+    fn disabled() -> Self {
+        Self { bearer: None }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.bearer.is_some()
+    }
+}
+
+impl Interceptor for ApiKeyInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if let Some(bearer) = &self.bearer {
+            request
+                .metadata_mut()
+                .insert("authorization", bearer.clone());
+        }
+        Ok(request)
     }
 }
 

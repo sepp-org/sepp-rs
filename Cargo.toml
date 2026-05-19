@@ -36,6 +36,7 @@ protoc-bin-vendored = "3"
 [features]
 default = ["opentelemetry"]
 opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
+tls = ["tonic/tls-ring", "tonic/tls-native-roots"]
 
 [[example]]
 name = "traced"
