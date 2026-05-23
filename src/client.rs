@@ -38,23 +38,107 @@ const _: fn() = || {
 };
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError {
     #[error("could not connect to Sepp server at {addr}: {reason}")]
     Connect { addr: String, reason: String },
     #[error("the API key is not a valid HTTP header value")]
     InvalidApiKey,
-    #[error("Internal RPC error: {0}")]
-    Rpc(#[from] tonic::Status),
-    #[error("Empty batch")]
+    #[error("transport failure: {0}")]
+    Transport(String),
+    #[error("authentication failed: {0}")]
+    Unauthenticated(String),
+    #[error("server is overloaded: {0}")]
+    Overloaded(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("server internal error: {0}")]
+    ServerInternal(String),
+    #[error("server returned unexpected status {code:?}: {message}")]
+    UnexpectedStatus { code: tonic::Code, message: String },
+    #[error("empty batch")]
     EmptyBatch,
     #[error("server returned {got} results for a batch of {expected} jobs")]
     BatchResultCountMismatch { expected: usize, got: usize },
-    #[error("Malformed response: {0}")]
+    #[error("malformed response: {0}")]
     MalformedResponse(&'static str),
     #[error("server returned a malformed job: {0}")]
     MalformedJob(#[from] JobConversionError),
     #[error("server returned malformed server info: {0}")]
     MalformedServerInfo(#[from] ServerInfoError),
+}
+
+impl From<tonic::Status> for ClientError {
+    fn from(s: tonic::Status) -> Self {
+        use tonic::Code;
+        let msg = s.message().to_string();
+        match s.code() {
+            Code::Unavailable | Code::DeadlineExceeded | Code::Aborted | Code::Cancelled => {
+                Self::Transport(msg)
+            }
+            Code::Unauthenticated | Code::PermissionDenied => Self::Unauthenticated(msg),
+            Code::ResourceExhausted => Self::Overloaded(msg),
+            Code::InvalidArgument => Self::InvalidRequest(msg),
+            Code::Internal | Code::DataLoss | Code::Unknown => Self::ServerInternal(msg),
+            code => Self::UnexpectedStatus { code, message: msg },
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum EnqueueError {
+    #[error("server rejected the job: {0}")]
+    Rejected(JobRejection),
+    #[error(transparent)]
+    Client(#[from] ClientError),
+}
+
+impl From<tonic::Status> for EnqueueError {
+    fn from(s: tonic::Status) -> Self {
+        Self::Client(s.into())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum LeaseError {
+    #[error("no in-flight job with this id (already acked, expired, or never existed)")]
+    JobNotFound,
+    #[error("attempt mismatch: the lease was reassigned")]
+    AttemptMismatch,
+    #[error(transparent)]
+    Client(#[from] ClientError),
+}
+
+impl From<tonic::Status> for LeaseError {
+    fn from(s: tonic::Status) -> Self {
+        use tonic::Code;
+        match s.code() {
+            Code::NotFound => Self::JobNotFound,
+            Code::FailedPrecondition => Self::AttemptMismatch,
+            _ => Self::Client(s.into()),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReserveError {
+    #[error("requested queues are not declared on the server: {0}")]
+    UnknownQueues(String),
+    #[error(transparent)]
+    Client(#[from] ClientError),
+}
+
+impl From<tonic::Status> for ReserveError {
+    fn from(s: tonic::Status) -> Self {
+        use tonic::Code;
+        match s.code() {
+            Code::FailedPrecondition => Self::UnknownQueues(s.message().to_string()),
+            _ => Self::Client(s.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -143,22 +227,19 @@ impl SeppClient {
         Ok(BatchOutcome { results })
     }
 
-    pub async fn enqueue(
-        &self,
-        job: EnqueueRequest,
-    ) -> Result<Result<EnqueueAck, JobRejection>, ClientError> {
-        let mut outcome = self
+    pub async fn enqueue(&self, job: EnqueueRequest) -> Result<EnqueueAck, EnqueueError> {
+        let mut results = self
             .enqueue_batch(std::iter::once(job))
             .await?
-            .results
+            .into_results()
             .into_iter();
 
-        match outcome.next() {
-            Some(Ok(ack)) => Ok(Ok(ack)),
-            Some(Err(rej)) => Ok(Err(rej)),
-            None => Err(ClientError::MalformedResponse(
+        match results.next() {
+            Some(Ok(ack)) => Ok(ack),
+            Some(Err(rej)) => Err(EnqueueError::Rejected(rej)),
+            None => Err(EnqueueError::Client(ClientError::MalformedResponse(
                 "empty results for single-job batch",
-            )),
+            ))),
         }
     }
 
@@ -212,7 +293,7 @@ impl SeppClient {
     }
 
     #[tracing::instrument(name = "sepp-rs.reserve", skip_all, fields(jobs, worker_id = self.worker_id.as_deref().unwrap_or("<none>")))]
-    pub async fn reserve(&self, opts: &ReserveOptions) -> Result<Option<Vec<Job>>, ClientError> {
+    pub async fn reserve(&self, opts: &ReserveOptions) -> Result<Option<Vec<Job>>, ReserveError> {
         let mut msg = pb::ReserveRequest::from(opts);
         msg.worker_id = self.worker_id.clone();
         let mut request = Request::new(msg);
@@ -240,7 +321,7 @@ impl SeppClient {
     }
 
     #[tracing::instrument(name = "sepp-rs.ack", skip_all, fields(job_id = %ctx.id, attempt = ctx.attempt, worker_id = self.worker_id.as_deref().unwrap_or("<none>")))]
-    pub async fn ack(&self, ctx: &JobCtx) -> Result<(), ClientError> {
+    pub async fn ack(&self, ctx: &JobCtx) -> Result<(), LeaseError> {
         let mut request = Request::new(pb::AckRequest {
             job_id: ctx.id.clone(),
             attempt: ctx.attempt,
@@ -258,7 +339,7 @@ impl SeppClient {
         ctx: &JobCtx,
         retry: RetryDirective,
         reason: impl Into<String>,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<bool, LeaseError> {
         let strategy = match retry {
             RetryDirective::Default => pb::nack_retry::Strategy::Default(()),
             RetryDirective::After(d) => pb::nack_retry::Strategy::DelayMs(d.as_millis() as u64),
@@ -283,7 +364,7 @@ impl SeppClient {
         &self,
         ctx: &JobCtx,
         extension: Duration,
-    ) -> Result<SystemTime, ClientError> {
+    ) -> Result<SystemTime, LeaseError> {
         self.extend_inner(&ctx.id, ctx.attempt, extension).await
     }
 
@@ -297,7 +378,7 @@ impl SeppClient {
         job_id: &str,
         attempt: u32,
         extension: Duration,
-    ) -> Result<SystemTime, ClientError> {
+    ) -> Result<SystemTime, LeaseError> {
         let mut request = Request::new(pb::ExtendRequest {
             job_id: job_id.to_string(),
             attempt,
@@ -307,9 +388,9 @@ impl SeppClient {
         inject_metadata(&mut request);
 
         let response = self.inner.clone().extend(request).await?.into_inner();
-        crate::millis_to_system_time(response.lease_expires_at).ok_or(
-            ClientError::MalformedResponse("extend returned an invalid lease_expires_at"),
-        )
+        crate::millis_to_system_time(response.lease_expires_at).ok_or_else(|| {
+            ClientError::MalformedResponse("extend returned an invalid lease_expires_at").into()
+        })
     }
 
     pub async fn get_server_info(&self) -> Result<ServerInfo, ClientError> {
@@ -352,7 +433,7 @@ impl Lease {
         self.expiry.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn extend(&self, by: Duration) -> Result<SystemTime, ClientError> {
+    pub(crate) async fn extend(&self, by: Duration) -> Result<SystemTime, LeaseError> {
         let new_expiry = self
             .client
             .extend_inner(&self.job_id, self.attempt, by)

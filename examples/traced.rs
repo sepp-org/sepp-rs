@@ -104,12 +104,8 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         data: b"hello, sepp".to_vec(),
         encoding: "text/plain".to_string(),
     });
-    match client.enqueue(job).await? {
-        Ok(ack) => println!("enqueued job {}", ack.job_id),
-        Err(rej) => {
-            return Err(format!("server rejected the job: {rej}").into());
-        }
-    }
+    let ack = client.enqueue(job).await?;
+    println!("enqueued job {}", ack.job_id);
 
     // 2. Run a worker. `process_job` opens the `sepp.process` span and links it
     //    back to the publish span recovered from the job's trace context.

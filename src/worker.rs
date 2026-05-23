@@ -6,7 +6,7 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
     Job, JobCtx, Payload, ReserveOptions,
-    client::{ClientError, Lease, RetryDirective, SeppClient},
+    client::{ClientError, Lease, LeaseError, RetryDirective, SeppClient},
     now_millis,
 };
 
@@ -273,7 +273,7 @@ async fn dispose(
     client: &SeppClient,
     ctx: &JobCtx,
     disposition: Disposition,
-) -> Result<(), ClientError> {
+) -> Result<(), LeaseError> {
     match disposition {
         Disposition::Completed(Ok(())) => {
             debug!("job completed; acking");

@@ -39,15 +39,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         encoding: "text/plain".to_string(),
     });
 
-    match client.enqueue(job).await? {
-        Ok(ack) => println!(
-            "enqueued job {} (deduplicated={})",
-            ack.job_id, ack.deduplicated
-        ),
-        Err(rej) => {
-            return Err(format!("server rejected the job: {rej}").into());
-        }
-    }
+    let ack = client.enqueue(job).await?;
+    println!(
+        "enqueued job {} (deduplicated={})",
+        ack.job_id, ack.deduplicated
+    );
 
     // 2. Launch a worker. The handler sends the job id back over a channel so
     //    the example can finish instead of looping in `run` forever.

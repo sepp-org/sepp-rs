@@ -581,7 +581,7 @@ impl JobCtx {
     pub async fn extend(
         &self,
         extension: Duration,
-    ) -> Result<SystemTime, crate::client::ClientError> {
+    ) -> Result<SystemTime, crate::client::LeaseError> {
         self.lease.extend(extension).await
     }
 }
