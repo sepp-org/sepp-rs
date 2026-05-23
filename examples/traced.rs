@@ -107,7 +107,7 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     match client.enqueue(job).await? {
         Ok(ack) => println!("enqueued job {}", ack.job_id),
         Err(rej) => {
-            return Err(format!("server rejected the job: {} — {}", rej.code, rej.message).into());
+            return Err(format!("server rejected the job: {rej}").into());
         }
     }
 

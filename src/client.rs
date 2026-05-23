@@ -125,12 +125,13 @@ impl SeppClient {
             results.push(match job_req.outcome {
                 Some(pb::job_result::Outcome::Success(r)) => {
                     debug!(job_id = %r.job_id, deduplicated = r.deduplicated, "job enqueued successfully");
-                    Ok(r.into()) 
-                },
-                Some(pb::job_result::Outcome::Error(e)) => {
-                    debug!(error = ?e, "server rejected the job");
-                    Err(e.into())
-                },
+                    Ok(r.into())
+                }
+                Some(pb::job_result::Outcome::Rejection(r)) => {
+                    let rejection: JobRejection = r.into();
+                    debug!(error = %rejection, "server rejected the job");
+                    Err(rejection)
+                }
                 None => {
                     return Err(ClientError::MalformedResponse(
                         "missing outcome in job result",
@@ -158,6 +159,55 @@ impl SeppClient {
             None => Err(ClientError::MalformedResponse(
                 "empty results for single-job batch",
             )),
+        }
+    }
+
+    #[tracing::instrument(name = "sepp-rs.enqueue_atomic", skip_all, fields(jobs))]
+    pub async fn enqueue_atomic(
+        &self,
+        jobs: impl IntoIterator<Item = EnqueueRequest>,
+    ) -> Result<Vec<EnqueueAck>, crate::AtomicEnqueueError> {
+        let jobs: Vec<pb::EnqueueRequest> = jobs.into_iter().map(Into::into).collect();
+        if jobs.is_empty() {
+            return Err(ClientError::EmptyBatch.into());
+        }
+        let sent = jobs.len();
+        tracing::Span::current().record("jobs", sent);
+
+        let mut request = Request::new(pb::EnqueueBatchRequest { jobs });
+        inject_trace_context(&mut request);
+
+        let response = self
+            .inner
+            .clone()
+            .enqueue_atomic(request)
+            .await?
+            .into_inner();
+
+        use pb::enqueue_atomic_response::Outcome;
+        match response.outcome {
+            Some(Outcome::Success(s)) => {
+                if s.responses.len() != sent {
+                    return Err(ClientError::BatchResultCountMismatch {
+                        expected: sent,
+                        got: s.responses.len(),
+                    }
+                    .into());
+                }
+                Ok(s.responses.into_iter().map(Into::into).collect())
+            }
+            Some(Outcome::Rejection(r)) => {
+                let errors: Vec<crate::JobValidationError> =
+                    r.errors.into_iter().map(Into::into).collect();
+                for e in &errors {
+                    debug!(index = e.index, error = %e.rejection, "atomic batch rejected job");
+                }
+                Err(crate::AtomicEnqueueError::Validation(errors))
+            }
+            None => Err(ClientError::MalformedResponse(
+                "missing outcome in EnqueueAtomicResponse",
+            )
+            .into()),
         }
     }
 

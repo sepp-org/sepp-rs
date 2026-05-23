@@ -45,7 +45,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ack.job_id, ack.deduplicated
         ),
         Err(rej) => {
-            return Err(format!("server rejected the job: {} — {}", rej.code, rej.message).into());
+            return Err(format!("server rejected the job: {rej}").into());
         }
     }
 

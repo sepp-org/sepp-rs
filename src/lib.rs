@@ -440,21 +440,126 @@ impl From<crate::pb::sepp::v1::EnqueueResponse> for EnqueueAck {
     }
 }
 
-// TODO: rethink this approach
-#[derive(Debug)]
-pub struct JobRejection {
-    pub code: String,
-    pub message: String,
-    pub context: HashMap<String, String>,
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum JobRejection {
+    #[error("queue {queue:?} is not declared on the server (strict mode)")]
+    UnknownQueue { queue: String },
+    #[error("payload size {actual} bytes exceeds the queue limit of {limit}")]
+    PayloadTooLarge { limit: u64, actual: u64 },
+    #[error("payload encoding {encoding:?} is not allowed; accepted: {allowed:?}")]
+    EncodingNotAllowed {
+        encoding: String,
+        allowed: Vec<String>,
+    },
+    #[error("job_type {job_type:?} is not accepted by this queue; accepted: {allowed:?}")]
+    JobTypeNotAllowed {
+        job_type: String,
+        allowed: Vec<String>,
+    },
+    #[error("custom map has {actual} entries, exceeding the queue limit of {limit}")]
+    CustomEntriesTooMany { limit: u32, actual: u32 },
+    #[error("custom map's total size {actual} bytes exceeds the queue limit of {limit}")]
+    CustomMapTooLarge { limit: u64, actual: u64 },
+    #[error("custom key {key:?} is {actual} bytes, exceeding the limit of {limit}")]
+    CustomKeyTooLong {
+        key: String,
+        limit: u32,
+        actual: u64,
+    },
+    #[error("queue name is {actual} bytes, exceeding the limit of {limit}")]
+    QueueNameTooLong { limit: u32, actual: u64 },
+    #[error("job_type is {actual} bytes, exceeding the limit of {limit}")]
+    JobTypeNameTooLong { limit: u32, actual: u64 },
+    #[error("idempotency_key is {actual} bytes, exceeding the limit of {limit}")]
+    IdempotencyKeyTooLong { limit: u32, actual: u64 },
+    #[error("scheduled_at {actual_ms}ms is beyond max_schedule_horizon_ms ({horizon_ms}ms)")]
+    ScheduledTooFar { horizon_ms: u64, actual_ms: i64 },
+    #[error("structural validation failed: {message}")]
+    InvalidRequest { message: String },
+    #[error("server returned an unrecognized rejection variant")]
+    Unknown,
 }
 
-impl From<crate::pb::sepp::v1::ErrorDetails> for JobRejection {
-    fn from(e: crate::pb::sepp::v1::ErrorDetails) -> Self {
-        Self {
-            code: e.code,
-            message: e.message,
-            context: e.context,
+impl From<crate::pb::sepp::v1::JobRejection> for JobRejection {
+    fn from(r: crate::pb::sepp::v1::JobRejection) -> Self {
+        use crate::pb::sepp::v1::job_rejection::Reason;
+        match r.reason {
+            Some(Reason::UnknownQueue(x)) => Self::UnknownQueue { queue: x.queue },
+            Some(Reason::PayloadTooLarge(x)) => Self::PayloadTooLarge {
+                limit: x.limit,
+                actual: x.actual,
+            },
+            Some(Reason::EncodingNotAllowed(x)) => Self::EncodingNotAllowed {
+                encoding: x.encoding,
+                allowed: x.allowed,
+            },
+            Some(Reason::JobTypeNotAllowed(x)) => Self::JobTypeNotAllowed {
+                job_type: x.job_type,
+                allowed: x.allowed,
+            },
+            Some(Reason::CustomEntriesTooMany(x)) => Self::CustomEntriesTooMany {
+                limit: x.limit,
+                actual: x.actual,
+            },
+            Some(Reason::CustomMapTooLarge(x)) => Self::CustomMapTooLarge {
+                limit: x.limit,
+                actual: x.actual,
+            },
+            Some(Reason::CustomKeyTooLong(x)) => Self::CustomKeyTooLong {
+                key: x.key,
+                limit: x.limit,
+                actual: x.actual,
+            },
+            Some(Reason::QueueNameTooLong(x)) => Self::QueueNameTooLong {
+                limit: x.limit,
+                actual: x.actual,
+            },
+            Some(Reason::JobTypeNameTooLong(x)) => Self::JobTypeNameTooLong {
+                limit: x.limit,
+                actual: x.actual,
+            },
+            Some(Reason::IdempotencyKeyTooLong(x)) => Self::IdempotencyKeyTooLong {
+                limit: x.limit,
+                actual: x.actual,
+            },
+            Some(Reason::ScheduledTooFar(x)) => Self::ScheduledTooFar {
+                horizon_ms: x.horizon_ms,
+                actual_ms: x.actual_ms,
+            },
+            Some(Reason::InvalidRequest(x)) => Self::InvalidRequest { message: x.message },
+            None => Self::Unknown,
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct JobValidationError {
+    pub index: u32,
+    pub rejection: JobRejection,
+}
+
+impl From<crate::pb::sepp::v1::JobValidationError> for JobValidationError {
+    fn from(e: crate::pb::sepp::v1::JobValidationError) -> Self {
+        Self {
+            index: e.index,
+            rejection: e.rejection.map(JobRejection::from).unwrap_or(JobRejection::Unknown),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AtomicEnqueueError {
+    #[error(transparent)]
+    Client(#[from] crate::client::ClientError),
+    #[error("atomic batch rejected: {} job(s) failed validation", _0.len())]
+    Validation(Vec<JobValidationError>),
+}
+
+impl From<tonic::Status> for AtomicEnqueueError {
+    fn from(s: tonic::Status) -> Self {
+        Self::Client(crate::client::ClientError::from(s))
     }
 }
 
