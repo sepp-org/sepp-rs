@@ -334,3 +334,58 @@ fn default_worker_id() -> String {
     let rand = uuid::Uuid::new_v4().simple().to_string();
     format!("{host}-{}-{}", std::process::id(), &rand[..8])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_interval_third_of_lease() {
+        assert_eq!(
+            heartbeat_interval(Duration::from_secs(3)),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_nine_seconds() {
+        assert_eq!(
+            heartbeat_interval(Duration::from_secs(9)),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_floor_at_one_ms_for_tiny_lease() {
+        assert_eq!(
+            heartbeat_interval(Duration::from_millis(1)),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn heartbeat_interval_floor_at_one_ms_for_zero_lease() {
+        assert_eq!(heartbeat_interval(Duration::ZERO), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn worker_err_retry() {
+        let e = WorkerError::retry("network");
+        assert!(matches!(e, WorkerError::Retry(s) if s == "network"));
+    }
+
+    #[test]
+    fn worker_err_retry_after() {
+        let e = WorkerError::retry_after("rate limited", Duration::from_secs(5));
+        assert!(matches!(
+            e,
+            WorkerError::RetryAfter(s, d) if s == "rate limited" && d == Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn worker_err_permanent() {
+        let e = WorkerError::permanent("bad input");
+        assert!(matches!(e, WorkerError::Permanent(s) if s == "bad input"));
+    }
+}

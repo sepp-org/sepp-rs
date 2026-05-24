@@ -640,3 +640,206 @@ fn inject_trace_context(request: &mut Request<pb::EnqueueBatchRequest>) {
     }
     inject_metadata(request);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    fn st(code: Code, msg: &str) -> tonic::Status {
+        tonic::Status::new(code, msg)
+    }
+
+    #[test]
+    fn client_err_unavailable_is_transport() {
+        assert!(matches!(
+            ClientError::from(st(Code::Unavailable, "x")),
+            ClientError::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_deadline_is_transport() {
+        assert!(matches!(
+            ClientError::from(st(Code::DeadlineExceeded, "x")),
+            ClientError::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_aborted_is_transport() {
+        assert!(matches!(
+            ClientError::from(st(Code::Aborted, "x")),
+            ClientError::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_cancelled_is_transport() {
+        assert!(matches!(
+            ClientError::from(st(Code::Cancelled, "x")),
+            ClientError::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_unauthenticated() {
+        assert!(matches!(
+            ClientError::from(st(Code::Unauthenticated, "x")),
+            ClientError::Unauthenticated(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_permission_denied_is_unauthenticated() {
+        assert!(matches!(
+            ClientError::from(st(Code::PermissionDenied, "x")),
+            ClientError::Unauthenticated(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_resource_exhausted_is_overloaded() {
+        assert!(matches!(
+            ClientError::from(st(Code::ResourceExhausted, "x")),
+            ClientError::Overloaded(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_invalid_argument_is_invalid_request() {
+        assert!(matches!(
+            ClientError::from(st(Code::InvalidArgument, "x")),
+            ClientError::InvalidRequest(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_internal_is_server_internal() {
+        assert!(matches!(
+            ClientError::from(st(Code::Internal, "x")),
+            ClientError::ServerInternal(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_data_loss_is_server_internal() {
+        assert!(matches!(
+            ClientError::from(st(Code::DataLoss, "x")),
+            ClientError::ServerInternal(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_unknown_is_server_internal() {
+        assert!(matches!(
+            ClientError::from(st(Code::Unknown, "x")),
+            ClientError::ServerInternal(_)
+        ));
+    }
+
+    #[test]
+    fn client_err_other_is_unexpected_status() {
+        match ClientError::from(st(Code::NotFound, "x")) {
+            ClientError::UnexpectedStatus { code, .. } => assert_eq!(code, Code::NotFound),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn client_err_preserves_message() {
+        match ClientError::from(st(Code::Internal, "boom")) {
+            ClientError::ServerInternal(m) => assert_eq!(m, "boom"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn enqueue_err_wraps_client() {
+        assert!(matches!(
+            EnqueueError::from(st(Code::Unavailable, "x")),
+            EnqueueError::Client(ClientError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn lease_err_not_found() {
+        assert!(matches!(
+            LeaseError::from(st(Code::NotFound, "x")),
+            LeaseError::JobNotFound
+        ));
+    }
+
+    #[test]
+    fn lease_err_failed_precondition_is_attempt_mismatch() {
+        assert!(matches!(
+            LeaseError::from(st(Code::FailedPrecondition, "x")),
+            LeaseError::AttemptMismatch
+        ));
+    }
+
+    #[test]
+    fn lease_err_other_wraps_client() {
+        assert!(matches!(
+            LeaseError::from(st(Code::Unavailable, "x")),
+            LeaseError::Client(ClientError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn reserve_err_failed_precondition_is_unknown_queues() {
+        match ReserveError::from(st(Code::FailedPrecondition, "queues: a, b")) {
+            ReserveError::UnknownQueues(m) => assert_eq!(m, "queues: a, b"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn reserve_err_other_wraps_client() {
+        assert!(matches!(
+            ReserveError::from(st(Code::Unavailable, "x")),
+            ReserveError::Client(ClientError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn atomic_enqueue_err_wraps_client() {
+        assert!(matches!(
+            crate::AtomicEnqueueError::from(st(Code::Unavailable, "x")),
+            crate::AtomicEnqueueError::Client(ClientError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn api_key_interceptor_rejects_invalid_header_value() {
+        // Newline in header value is not a valid HTTP header
+        assert!(ApiKeyInterceptor::new(Some("bad\nkey")).is_none());
+    }
+
+    #[test]
+    fn api_key_interceptor_none_disables_auth() {
+        let interceptor = ApiKeyInterceptor::new(None).unwrap();
+        assert!(!interceptor.is_enabled());
+    }
+
+    #[test]
+    fn api_key_interceptor_some_enables_auth() {
+        let interceptor = ApiKeyInterceptor::new(Some("token")).unwrap();
+        assert!(interceptor.is_enabled());
+    }
+
+    #[test]
+    fn api_key_interceptor_injects_bearer_header() {
+        let mut interceptor = ApiKeyInterceptor::new(Some("token")).unwrap();
+        let req = interceptor.call(Request::new(())).unwrap();
+        let auth = req.metadata().get("authorization").unwrap();
+        assert_eq!(auth.to_str().unwrap(), "Bearer token");
+    }
+
+    #[test]
+    fn api_key_interceptor_disabled_leaves_metadata_empty() {
+        let mut interceptor = ApiKeyInterceptor::disabled();
+        let req = interceptor.call(Request::new(())).unwrap();
+        assert!(req.metadata().get("authorization").is_none());
+    }
+}
