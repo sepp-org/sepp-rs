@@ -304,6 +304,13 @@ async fn heartbeat(lease: Lease, cfg: AutoExtend, handler: AbortHandle) {
 
         match lease.extend(cfg.extend_by).await {
             Ok(expiry) => debug!(?expiry, "lease extended"),
+            Err(err @ (LeaseError::AttemptMismatch | LeaseError::JobNotFound)) => {
+                error!(
+                    "lease reassigned by server ({err}); aborting handler to avoid double processing"
+                );
+                handler.abort();
+                return;
+            }
             Err(err) => {
                 if now_millis() >= lease.known_expiry_ms() {
                     error!("lease lost ({err}); aborting handler to avoid double processing");
