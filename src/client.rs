@@ -29,7 +29,6 @@ type AuthChannel = InterceptedService<Channel, ApiKeyInterceptor>;
 #[derive(Clone)]
 pub struct SeppClient {
     inner: QueueServiceClient<AuthChannel>,
-    worker_id: Option<String>,
     retry_policy: Arc<RetryPolicy>,
 }
 
@@ -214,24 +213,8 @@ impl SeppClient {
     pub fn from_channel(channel: Channel) -> Self {
         Self {
             inner: QueueServiceClient::with_interceptor(channel, ApiKeyInterceptor::disabled()),
-            worker_id: None,
             retry_policy: Arc::new(RetryPolicy::default()),
         }
-    }
-
-    pub fn with_worker_id(mut self, worker_id: impl Into<String>) -> Self {
-        self.worker_id = Some(worker_id.into());
-        self
-    }
-
-    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
-        self.retry_policy = Arc::new(policy);
-        self
-    }
-
-    /// The worker identifier this client reports, if any.
-    pub fn worker_id(&self) -> Option<&str> {
-        self.worker_id.as_deref()
     }
 
     #[tracing::instrument(name = "sepp-rs.enqueue", skip_all, fields(jobs))]
@@ -346,10 +329,9 @@ impl SeppClient {
         }
     }
 
-    #[tracing::instrument(name = "sepp-rs.reserve", skip_all, fields(jobs, worker_id = self.worker_id.as_deref().unwrap_or("<none>")))]
+    #[tracing::instrument(name = "sepp-rs.reserve", skip_all, fields(jobs, worker_id = opts.worker_id.as_deref().unwrap_or("<none>")))]
     pub async fn reserve(&self, opts: &ReserveOptions) -> Result<Option<Vec<Job>>, ReserveError> {
-        let mut msg = pb::ReserveRequest::from(opts);
-        msg.worker_id = self.worker_id.clone();
+        let msg = pb::ReserveRequest::from(opts);
         let mut request = Request::new(msg);
         request.set_timeout(opts.wait_timeout() + RESERVE_DEADLINE_SLACK);
         inject_metadata(&mut request);
@@ -359,7 +341,7 @@ impl SeppClient {
         // A single malformed job must not discard the rest of the batch
         let mut jobs = Vec::with_capacity(response.jobs.len());
         for job in response.jobs {
-            match crate::job_from_pb(self, job) {
+            match crate::job_from_pb(self, job, opts.worker_id.as_deref()) {
                 Ok(job) => jobs.push(job),
                 Err(e) => warn!(error = %e, "skipping malformed job in reserve response"),
             }
@@ -374,12 +356,12 @@ impl SeppClient {
         Ok(Some(jobs))
     }
 
-    #[tracing::instrument(name = "sepp-rs.ack", skip_all, fields(job_id = %ctx.id, attempt = ctx.attempt, worker_id = self.worker_id.as_deref().unwrap_or("<none>")))]
+    #[tracing::instrument(name = "sepp-rs.ack", skip_all, fields(job_id = %ctx.id, attempt = ctx.attempt, worker_id = ctx.lease.worker_id.as_deref().unwrap_or("<none>")))]
     pub async fn ack(&self, ctx: &JobCtx) -> Result<(), LeaseError> {
         let body = pb::AckRequest {
             job_id: ctx.id.clone(),
             attempt: ctx.attempt,
-            worker_id: self.worker_id.clone(),
+            worker_id: ctx.lease.worker_id.clone(),
         };
         with_retry(&self.retry_policy, "ack", || {
             let mut request = Request::new(body.clone());
@@ -391,7 +373,7 @@ impl SeppClient {
         Ok(())
     }
 
-    #[tracing::instrument(name = "sepp-rs.nack", skip_all, fields(job_id = %ctx.id, attempt = ctx.attempt, worker_id = self.worker_id.as_deref().unwrap_or("<none>")))]
+    #[tracing::instrument(name = "sepp-rs.nack", skip_all, fields(job_id = %ctx.id, attempt = ctx.attempt, worker_id = ctx.lease.worker_id.as_deref().unwrap_or("<none>")))]
     pub async fn nack(
         &self,
         ctx: &JobCtx,
@@ -410,7 +392,7 @@ impl SeppClient {
             retry: Some(pb::NackRetry {
                 strategy: Some(strategy),
             }),
-            worker_id: self.worker_id.clone(),
+            worker_id: ctx.lease.worker_id.clone(),
         };
 
         let response = with_retry(&self.retry_policy, "nack", || {
@@ -428,25 +410,32 @@ impl SeppClient {
         ctx: &JobCtx,
         extension: Duration,
     ) -> Result<SystemTime, LeaseError> {
-        self.extend_inner(&ctx.id, ctx.attempt, extension).await
+        self.extend_inner(
+            &ctx.id,
+            ctx.attempt,
+            extension,
+            ctx.lease.worker_id.as_deref(),
+        )
+        .await
     }
 
     #[tracing::instrument(
         name = "sepp-rs.extend",
         skip_all,
-        fields(job_id = %job_id, attempt, worker_id = self.worker_id.as_deref().unwrap_or("<none>"))
+        fields(job_id = %job_id, attempt, worker_id = worker_id.unwrap_or("<none>"))
     )]
     pub(crate) async fn extend_inner(
         &self,
         job_id: &str,
         attempt: u32,
         extension: Duration,
+        worker_id: Option<&str>,
     ) -> Result<SystemTime, LeaseError> {
         let body = pb::ExtendRequest {
             job_id: job_id.to_string(),
             attempt,
             lease_duration_ms: extension.as_millis() as u64,
-            worker_id: self.worker_id.clone(),
+            worker_id: worker_id.map(String::from),
         };
 
         let response = with_retry(&self.retry_policy, "extend", || {
@@ -479,6 +468,7 @@ pub(crate) struct Lease {
     job_id: String,
     attempt: u32,
     expiry: Arc<AtomicI64>,
+    worker_id: Option<String>,
 }
 
 impl Lease {
@@ -487,6 +477,7 @@ impl Lease {
         job_id: String,
         attempt: u32,
         lease_expires_at: SystemTime,
+        worker_id: Option<String>,
     ) -> Self {
         Self {
             client,
@@ -495,6 +486,7 @@ impl Lease {
             expiry: Arc::new(AtomicI64::new(crate::system_time_to_millis(
                 lease_expires_at,
             ))),
+            worker_id,
         }
     }
 
@@ -505,7 +497,7 @@ impl Lease {
     pub(crate) async fn extend(&self, by: Duration) -> Result<SystemTime, LeaseError> {
         let new_expiry = self
             .client
-            .extend_inner(&self.job_id, self.attempt, by)
+            .extend_inner(&self.job_id, self.attempt, by, self.worker_id.as_deref())
             .await?;
         self.expiry
             .store(crate::system_time_to_millis(new_expiry), Ordering::Release);
@@ -526,7 +518,6 @@ impl std::fmt::Debug for Lease {
 pub struct SeppClientBuilder {
     addr: String,
     api_key: Option<String>,
-    worker_id: Option<String>,
     retry_policy: RetryPolicy,
     #[cfg(feature = "tls")]
     tls: Option<ClientTlsConfig>,
@@ -537,7 +528,6 @@ impl SeppClientBuilder {
         Self {
             addr: addr.into(),
             api_key: None,
-            worker_id: None,
             retry_policy: RetryPolicy::default(),
             #[cfg(feature = "tls")]
             tls: None,
@@ -546,11 +536,6 @@ impl SeppClientBuilder {
 
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
-        self
-    }
-
-    pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
-        self.worker_id = Some(worker_id.into());
         self
     }
 
@@ -636,7 +621,6 @@ impl SeppClientBuilder {
 
         Ok(SeppClient {
             inner: QueueServiceClient::with_interceptor(channel, interceptor),
-            worker_id: self.worker_id,
             retry_policy: Arc::new(self.retry_policy),
         })
     }

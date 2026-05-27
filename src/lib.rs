@@ -544,7 +544,10 @@ impl From<crate::pb::sepp::v1::JobValidationError> for JobValidationError {
     fn from(e: crate::pb::sepp::v1::JobValidationError) -> Self {
         Self {
             index: e.index,
-            rejection: e.rejection.map(JobRejection::from).unwrap_or(JobRejection::Unknown),
+            rejection: e
+                .rejection
+                .map(JobRejection::from)
+                .unwrap_or(JobRejection::Unknown),
         }
     }
 }
@@ -668,6 +671,7 @@ pub(crate) fn now_millis() -> i64 {
 pub(crate) fn job_from_pb(
     client: &crate::client::SeppClient,
     j: crate::pb::sepp::v1::Job,
+    worker_id: Option<&str>,
 ) -> Result<Job, JobConversionError> {
     use JobConversionError as E;
 
@@ -705,8 +709,13 @@ pub(crate) fn job_from_pb(
         .trace_context
         .and_then(|tc| TraceContext::try_from(tc).ok());
 
-    let lease =
-        crate::client::Lease::new(client.clone(), j.id.clone(), j.attempt, lease_expires_at);
+    let lease = crate::client::Lease::new(
+        client.clone(),
+        j.id.clone(),
+        j.attempt,
+        lease_expires_at,
+        worker_id.map(String::from),
+    );
 
     Ok(Job {
         payload: j.payload.map(Into::into),
@@ -983,7 +992,10 @@ mod tests {
 
     #[test]
     fn priority_u8_max_rejected() {
-        assert!(matches!(Priority::new(u8::MAX), Err(PriorityOutOfRange(255))));
+        assert!(matches!(
+            Priority::new(u8::MAX),
+            Err(PriorityOutOfRange(255))
+        ));
     }
 
     #[test]
@@ -1339,7 +1351,10 @@ mod tests {
         ));
         assert!(matches!(
             JobRejection::from(pb),
-            JobRejection::CustomEntriesTooMany { limit: 5, actual: 6 }
+            JobRejection::CustomEntriesTooMany {
+                limit: 5,
+                actual: 6
+            }
         ));
     }
 
@@ -1353,7 +1368,10 @@ mod tests {
         ));
         assert!(matches!(
             JobRejection::from(pb),
-            JobRejection::CustomMapTooLarge { limit: 100, actual: 200 }
+            JobRejection::CustomMapTooLarge {
+                limit: 100,
+                actual: 200
+            }
         ));
     }
 
@@ -1386,7 +1404,10 @@ mod tests {
         ));
         assert!(matches!(
             JobRejection::from(pb),
-            JobRejection::QueueNameTooLong { limit: 1, actual: 2 }
+            JobRejection::QueueNameTooLong {
+                limit: 1,
+                actual: 2
+            }
         ));
     }
 
@@ -1400,7 +1421,10 @@ mod tests {
         ));
         assert!(matches!(
             JobRejection::from(pb),
-            JobRejection::JobTypeNameTooLong { limit: 3, actual: 4 }
+            JobRejection::JobTypeNameTooLong {
+                limit: 3,
+                actual: 4
+            }
         ));
     }
 
@@ -1414,7 +1438,10 @@ mod tests {
         ));
         assert!(matches!(
             JobRejection::from(pb),
-            JobRejection::IdempotencyKeyTooLong { limit: 8, actual: 9 }
+            JobRejection::IdempotencyKeyTooLong {
+                limit: 8,
+                actual: 9
+            }
         ));
     }
 
@@ -1428,7 +1455,10 @@ mod tests {
         ));
         assert!(matches!(
             JobRejection::from(pb),
-            JobRejection::ScheduledTooFar { horizon_ms: 60_000, actual_ms: 120_000 }
+            JobRejection::ScheduledTooFar {
+                horizon_ms: 60_000,
+                actual_ms: 120_000
+            }
         ));
     }
 
@@ -1461,9 +1491,7 @@ mod tests {
         };
         let e = JobValidationError::from(pb);
         assert_eq!(e.index, 3);
-        assert!(
-            matches!(e.rejection, JobRejection::UnknownQueue { queue } if queue == "q")
-        );
+        assert!(matches!(e.rejection, JobRejection::UnknownQueue { queue } if queue == "q"));
     }
 
     #[test]
@@ -1506,7 +1534,7 @@ mod tests {
                 value: Some(pb::primitive_value::Value::StringValue("v".into())),
             },
         );
-        let job = job_from_pb(&client, p).unwrap();
+        let job = job_from_pb(&client, p, None).unwrap();
         assert_eq!(job.ctx.id, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(job.ctx.job_type, "send_email");
         assert_eq!(job.ctx.priority.get(), 3);
@@ -1525,7 +1553,7 @@ mod tests {
         let mut p = valid_job_pb();
         p.id.clear();
         assert!(matches!(
-            job_from_pb(&client, p),
+            job_from_pb(&client, p, None),
             Err(JobConversionError::MissingField("id"))
         ));
     }
@@ -1536,7 +1564,7 @@ mod tests {
         let mut p = valid_job_pb();
         p.job_type.clear();
         assert!(matches!(
-            job_from_pb(&client, p),
+            job_from_pb(&client, p, None),
             Err(JobConversionError::MissingField("job_type"))
         ));
     }
@@ -1547,7 +1575,7 @@ mod tests {
         let mut p = valid_job_pb();
         p.priority = 10;
         assert!(matches!(
-            job_from_pb(&client, p),
+            job_from_pb(&client, p, None),
             Err(JobConversionError::PriorityOutOfRange(10))
         ));
     }
@@ -1558,7 +1586,7 @@ mod tests {
         let mut p = valid_job_pb();
         p.priority = 300;
         assert!(matches!(
-            job_from_pb(&client, p),
+            job_from_pb(&client, p, None),
             Err(JobConversionError::PriorityOutOfRange(300))
         ));
     }
@@ -1569,7 +1597,7 @@ mod tests {
         let mut p = valid_job_pb();
         p.enqueued_at = -1;
         assert!(matches!(
-            job_from_pb(&client, p),
+            job_from_pb(&client, p, None),
             Err(JobConversionError::InvalidTimestamp {
                 field: "enqueued_at",
                 value: -1
@@ -1583,7 +1611,7 @@ mod tests {
         let mut p = valid_job_pb();
         p.lease_expires_at = -5;
         assert!(matches!(
-            job_from_pb(&client, p),
+            job_from_pb(&client, p, None),
             Err(JobConversionError::InvalidTimestamp {
                 field: "lease_expires_at",
                 value: -5
@@ -1597,7 +1625,7 @@ mod tests {
         let mut p = valid_job_pb();
         p.custom
             .insert("k".into(), pb::PrimitiveValue { value: None });
-        match job_from_pb(&client, p) {
+        match job_from_pb(&client, p, None) {
             Err(JobConversionError::EmptyCustomValue(k)) => assert_eq!(k, "k"),
             _ => panic!("expected EmptyCustomValue"),
         }
@@ -1611,7 +1639,7 @@ mod tests {
             traceparent: "garbage".into(),
             tracestate: None,
         });
-        let job = job_from_pb(&client, p).unwrap();
+        let job = job_from_pb(&client, p, None).unwrap();
         assert!(job.ctx.trace_context.is_none());
     }
 
@@ -1623,7 +1651,7 @@ mod tests {
             traceparent: VALID_TP.into(),
             tracestate: Some("v=1".into()),
         });
-        let job = job_from_pb(&client, p).unwrap();
+        let job = job_from_pb(&client, p, None).unwrap();
         let tc = job.ctx.trace_context.as_ref().unwrap();
         assert_eq!(tc.traceparent(), VALID_TP);
         assert_eq!(tc.tracestate(), Some("v=1"));
@@ -1768,10 +1796,7 @@ mod tests {
     fn server_info_happy_path() {
         let info = ServerInfo::try_from(valid_server_info_pb()).unwrap();
         assert_eq!(info.version, "1.2.3");
-        assert_eq!(
-            info.supported_protocol_versions,
-            vec!["v1".to_string()]
-        );
+        assert_eq!(info.supported_protocol_versions, vec!["v1".to_string()]);
         assert_eq!(info.allowed_encodings, vec!["json".to_string()]);
         assert!(!info.restricts_encodings);
         assert_eq!(info.max_payload_size, 1024);

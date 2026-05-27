@@ -79,9 +79,7 @@ impl Metrics {
                 .build(),
             jobs_nacked: meter
                 .u64_counter("sepp_rs.jobs.nacked")
-                .with_description(
-                    "Jobs nacked. Attribute `outcome` is `retry` or `dead_letter`.",
-                )
+                .with_description("Jobs nacked. Attribute `outcome` is `retry` or `dead_letter`.")
                 .build(),
             jobs_in_flight: meter
                 .i64_up_down_counter("sepp_rs.jobs.in_flight")
@@ -113,7 +111,11 @@ impl Metrics {
     fn record_nacked(&self, dead_lettered: bool) {
         #[cfg(feature = "opentelemetry")]
         {
-            let outcome = if dead_lettered { "dead_letter" } else { "retry" };
+            let outcome = if dead_lettered {
+                "dead_letter"
+            } else {
+                "retry"
+            };
             self.jobs_nacked
                 .add(1, &[opentelemetry::KeyValue::new("outcome", outcome)]);
         }
@@ -184,12 +186,10 @@ impl ShutdownHandle {
 }
 
 impl Worker {
-    pub fn new(client: SeppClient, opts: ReserveOptions) -> Self {
-        let client = if client.worker_id().is_some() {
-            client
-        } else {
-            client.with_worker_id(default_worker_id())
-        };
+    pub fn new(client: SeppClient, mut opts: ReserveOptions) -> Self {
+        if opts.worker_id.is_none() {
+            opts.worker_id = Some(default_worker_id());
+        }
         Self {
             client,
             opts,
@@ -235,7 +235,7 @@ impl Worker {
     }
 
     pub fn with_worker_id(mut self, worker_id: impl Into<String>) -> Self {
-        self.client = self.client.with_worker_id(worker_id);
+        self.opts.worker_id = Some(worker_id.into());
         self
     }
 
@@ -260,7 +260,7 @@ impl Worker {
         let shutdown = self.shutdown.clone();
         let metrics = Arc::clone(&self.metrics);
         info!(
-            worker_id = self.client.worker_id().unwrap_or("<none>"),
+            worker_id = self.opts.worker_id.as_deref().unwrap_or("<none>"),
             max_in_flight = self.max_in_flight,
             handlers = handlers.len(),
             auto_extend = auto_extend.is_some(),
