@@ -47,12 +47,119 @@ pub struct Worker {
     reserve_error_backoff: Duration,
     auto_extend: Option<AutoExtend>,
     shutdown: ShutdownHandle,
+    metrics: Arc<Metrics>,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct AutoExtend {
     interval: Duration,
     extend_by: Duration,
+}
+
+#[cfg(feature = "opentelemetry")]
+struct Metrics {
+    jobs_processed: opentelemetry::metrics::Counter<u64>,
+    jobs_nacked: opentelemetry::metrics::Counter<u64>,
+    jobs_in_flight: opentelemetry::metrics::UpDownCounter<i64>,
+    reserves_completed: opentelemetry::metrics::Counter<u64>,
+    reserves_failed: opentelemetry::metrics::Counter<u64>,
+}
+
+#[cfg(not(feature = "opentelemetry"))]
+struct Metrics;
+
+impl Metrics {
+    #[cfg(feature = "opentelemetry")]
+    fn new() -> Self {
+        let meter = opentelemetry::global::meter("sepp-rs");
+        Self {
+            jobs_processed: meter
+                .u64_counter("sepp_rs.jobs.processed")
+                .with_description("Jobs successfully acked.")
+                .build(),
+            jobs_nacked: meter
+                .u64_counter("sepp_rs.jobs.nacked")
+                .with_description(
+                    "Jobs nacked. Attribute `outcome` is `retry` or `dead_letter`.",
+                )
+                .build(),
+            jobs_in_flight: meter
+                .i64_up_down_counter("sepp_rs.jobs.in_flight")
+                .with_description("Jobs currently being processed by handlers.")
+                .build(),
+            reserves_completed: meter
+                .u64_counter("sepp_rs.reserves.completed")
+                .with_description(
+                    "Reserve RPCs that returned. Attribute `jobs` is `some` or `empty`.",
+                )
+                .build(),
+            reserves_failed: meter
+                .u64_counter("sepp_rs.reserves.failed")
+                .with_description("Reserve RPCs that failed.")
+                .build(),
+        }
+    }
+
+    #[cfg(not(feature = "opentelemetry"))]
+    fn new() -> Self {
+        Self
+    }
+
+    fn record_processed(&self) {
+        #[cfg(feature = "opentelemetry")]
+        self.jobs_processed.add(1, &[]);
+    }
+
+    fn record_nacked(&self, dead_lettered: bool) {
+        #[cfg(feature = "opentelemetry")]
+        {
+            let outcome = if dead_lettered { "dead_letter" } else { "retry" };
+            self.jobs_nacked
+                .add(1, &[opentelemetry::KeyValue::new("outcome", outcome)]);
+        }
+        #[cfg(not(feature = "opentelemetry"))]
+        let _ = dead_lettered;
+    }
+
+    fn record_in_flight_delta(&self, delta: i64) {
+        #[cfg(feature = "opentelemetry")]
+        self.jobs_in_flight.add(delta, &[]);
+        #[cfg(not(feature = "opentelemetry"))]
+        let _ = delta;
+    }
+
+    fn record_reserve_ok(&self, empty: bool) {
+        #[cfg(feature = "opentelemetry")]
+        {
+            let jobs = if empty { "empty" } else { "some" };
+            self.reserves_completed
+                .add(1, &[opentelemetry::KeyValue::new("jobs", jobs)]);
+        }
+        #[cfg(not(feature = "opentelemetry"))]
+        let _ = empty;
+    }
+
+    fn record_reserve_failed(&self) {
+        #[cfg(feature = "opentelemetry")]
+        self.reserves_failed.add(1, &[]);
+    }
+}
+
+struct InFlightGuard {
+    metrics: Arc<Metrics>,
+}
+
+impl InFlightGuard {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        metrics.record_in_flight_delta(1);
+        Self { metrics }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.metrics.record_in_flight_delta(-1);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +198,7 @@ impl Worker {
             reserve_error_backoff: Duration::from_secs(1),
             auto_extend: None,
             shutdown: ShutdownHandle::new(),
+            metrics: Arc::new(Metrics::new()),
         }
     }
 
@@ -150,6 +258,7 @@ impl Worker {
         let handlers = Arc::new(self.handlers);
         let auto_extend = self.auto_extend;
         let shutdown = self.shutdown.clone();
+        let metrics = Arc::clone(&self.metrics);
         info!(
             worker_id = self.client.worker_id().unwrap_or("<none>"),
             max_in_flight = self.max_in_flight,
@@ -178,9 +287,16 @@ impl Worker {
                     break 'outer;
                 }
                 res = self.client.reserve(&opts) => match res {
-                    Ok(Some(jobs)) => jobs,
-                    Ok(None) => continue, // wait window elapsed — re-poll immediately
+                    Ok(Some(jobs)) => {
+                        metrics.record_reserve_ok(false);
+                        jobs
+                    }
+                    Ok(None) => {
+                        metrics.record_reserve_ok(true);
+                        continue; // wait window elapsed — re-poll immediately
+                    }
                     Err(_err) => {
+                        metrics.record_reserve_failed();
                         warn!(
                             "reserve error: {_err}; backing off for {:?}",
                             self.reserve_error_backoff
@@ -200,9 +316,12 @@ impl Worker {
             {
                 let client = self.client.clone();
                 let handlers = Arc::clone(&handlers);
+                let metrics = Arc::clone(&metrics);
+                let in_flight = InFlightGuard::new(Arc::clone(&metrics));
                 tokio::spawn(async move {
                     let _permit = permit; // held for the job's lifetime
-                    process_job(&client, &handlers, auto_extend, first).await;
+                    let _in_flight = in_flight;
+                    process_job(&client, &handlers, auto_extend, first, &metrics).await;
                 });
             }
 
@@ -214,9 +333,12 @@ impl Worker {
                     .expect("semaphore is never closed");
                 let client = self.client.clone();
                 let handlers = Arc::clone(&handlers);
+                let metrics = Arc::clone(&metrics);
+                let in_flight = InFlightGuard::new(Arc::clone(&metrics));
                 tokio::spawn(async move {
                     let _permit = permit;
-                    process_job(&client, &handlers, auto_extend, job).await;
+                    let _in_flight = in_flight;
+                    process_job(&client, &handlers, auto_extend, job, &metrics).await;
                 });
             }
         }
@@ -236,6 +358,7 @@ async fn process_job(
     handlers: &HashMap<String, Handler>,
     auto_extend: Option<AutoExtend>,
     job: Job,
+    metrics: &Metrics,
 ) {
     let span = tracing::info_span!(
         "sepp-rs.process",
@@ -255,7 +378,7 @@ async fn process_job(
         span.add_link(link);
     }
 
-    run_job(client, handlers, auto_extend, job)
+    run_job(client, handlers, auto_extend, job, metrics)
         .instrument(span)
         .await
 }
@@ -265,6 +388,7 @@ async fn run_job(
     handlers: &HashMap<String, Handler>,
     auto_extend: Option<AutoExtend>,
     job: Job,
+    metrics: &Metrics,
 ) {
     let Job { payload, ctx } = job;
     let lease = ctx.lease.clone();
@@ -309,7 +433,7 @@ async fn run_job(
         }
     };
 
-    if let Err(err) = dispose(client, &ctx, disposition).await {
+    if let Err(err) = dispose(client, &ctx, disposition, metrics).await {
         error!("failed to ack/nack job; it will be redelivered after lease expiry: {err}");
     }
 }
@@ -323,11 +447,14 @@ async fn dispose(
     client: &SeppClient,
     ctx: &JobCtx,
     disposition: Disposition,
+    metrics: &Metrics,
 ) -> Result<(), LeaseError> {
     match disposition {
         Disposition::Completed(Ok(())) => {
             debug!("job completed; acking");
-            client.ack(ctx).await.map(drop)
+            client.ack(ctx).await?;
+            metrics.record_processed();
+            Ok(())
         }
         Disposition::Completed(Err(err)) => {
             warn!("handler returned error; nacking: {err}");
@@ -336,14 +463,17 @@ async fn dispose(
                 WorkerError::RetryAfter(r, d) => (RetryDirective::After(d), r),
                 WorkerError::Permanent(r) => (RetryDirective::DeadLetter, r),
             };
-            client.nack(ctx, retry, reason).await.map(drop)
+            let dead_lettered = client.nack(ctx, retry, reason).await?;
+            metrics.record_nacked(dead_lettered);
+            Ok(())
         }
         Disposition::Panicked => {
             error!("handler panicked; nacking");
-            client
+            let dead_lettered = client
                 .nack(ctx, RetryDirective::Default, "handler panicked")
-                .await
-                .map(drop)
+                .await?;
+            metrics.record_nacked(dead_lettered);
+            Ok(())
         }
     }
 }
