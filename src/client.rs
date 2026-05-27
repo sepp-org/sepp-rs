@@ -7,14 +7,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+#[cfg(feature = "tls")]
+use tonic::transport::{Certificate, ClientTlsConfig};
 use tonic::{
     Request, Status,
     metadata::{Ascii, MetadataValue},
     service::{Interceptor, interceptor::InterceptedService},
     transport::{Channel, Endpoint},
 };
-#[cfg(feature = "tls")]
-use tonic::transport::{Certificate, ClientTlsConfig};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -30,6 +30,7 @@ type AuthChannel = InterceptedService<Channel, ApiKeyInterceptor>;
 pub struct SeppClient {
     inner: QueueServiceClient<AuthChannel>,
     worker_id: Option<String>,
+    retry_policy: Arc<RetryPolicy>,
 }
 
 const _: fn() = || {
@@ -148,6 +149,58 @@ pub enum RetryDirective {
     DeadLetter,
 }
 
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    max_attempts: u32,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    multiplier: f64,
+    jitter: bool,
+}
+
+impl RetryPolicy {
+    pub fn with_max_attempts(mut self, n: u32) -> Self {
+        self.max_attempts = n.max(1);
+        self
+    }
+
+    pub fn with_initial_backoff(mut self, d: Duration) -> Self {
+        self.initial_backoff = d;
+        self
+    }
+
+    pub fn with_max_backoff(mut self, d: Duration) -> Self {
+        self.max_backoff = d;
+        self
+    }
+
+    pub fn with_multiplier(mut self, m: f64) -> Self {
+        self.multiplier = m.max(1.0);
+        self
+    }
+
+    pub fn without_jitter(mut self) -> Self {
+        self.jitter = false;
+        self
+    }
+
+    pub fn max_attempts(&self) -> u32 {
+        self.max_attempts
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 1,
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            multiplier: 2.0,
+            jitter: true,
+        }
+    }
+}
+
 impl SeppClient {
     /// Connect to a Sepp server over plaintext with no authentication.
     pub async fn connect(addr: impl Into<String>) -> Result<Self, ClientError> {
@@ -162,11 +215,17 @@ impl SeppClient {
         Self {
             inner: QueueServiceClient::with_interceptor(channel, ApiKeyInterceptor::disabled()),
             worker_id: None,
+            retry_policy: Arc::new(RetryPolicy::default()),
         }
     }
 
     pub fn with_worker_id(mut self, worker_id: impl Into<String>) -> Self {
         self.worker_id = Some(worker_id.into());
+        self
+    }
+
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Arc::new(policy);
         self
     }
 
@@ -187,15 +246,13 @@ impl SeppClient {
         let sent = jobs.len();
         tracing::Span::current().record("jobs", sent);
 
-        let mut request = Request::new(pb::EnqueueBatchRequest { jobs });
-
-        inject_trace_context(&mut request);
-        let response = self
-            .inner
-            .clone()
-            .enqueue_batch(request)
-            .await?
-            .into_inner();
+        let response = with_retry(&self.retry_policy, "enqueue_batch", || {
+            let mut request = Request::new(pb::EnqueueBatchRequest { jobs: jobs.clone() });
+            inject_trace_context(&mut request);
+            let mut inner = self.inner.clone();
+            async move { inner.enqueue_batch(request).await.map(|r| r.into_inner()) }
+        })
+        .await?;
 
         if response.results.len() != sent {
             return Err(ClientError::BatchResultCountMismatch {
@@ -255,15 +312,13 @@ impl SeppClient {
         let sent = jobs.len();
         tracing::Span::current().record("jobs", sent);
 
-        let mut request = Request::new(pb::EnqueueBatchRequest { jobs });
-        inject_trace_context(&mut request);
-
-        let response = self
-            .inner
-            .clone()
-            .enqueue_atomic(request)
-            .await?
-            .into_inner();
+        let response = with_retry(&self.retry_policy, "enqueue_atomic", || {
+            let mut request = Request::new(pb::EnqueueBatchRequest { jobs: jobs.clone() });
+            inject_trace_context(&mut request);
+            let mut inner = self.inner.clone();
+            async move { inner.enqueue_atomic(request).await.map(|r| r.into_inner()) }
+        })
+        .await?;
 
         use pb::enqueue_atomic_response::Outcome;
         match response.outcome {
@@ -285,10 +340,9 @@ impl SeppClient {
                 }
                 Err(crate::AtomicEnqueueError::Validation(errors))
             }
-            None => Err(ClientError::MalformedResponse(
-                "missing outcome in EnqueueAtomicResponse",
-            )
-            .into()),
+            None => Err(
+                ClientError::MalformedResponse("missing outcome in EnqueueAtomicResponse").into(),
+            ),
         }
     }
 
@@ -322,14 +376,18 @@ impl SeppClient {
 
     #[tracing::instrument(name = "sepp-rs.ack", skip_all, fields(job_id = %ctx.id, attempt = ctx.attempt, worker_id = self.worker_id.as_deref().unwrap_or("<none>")))]
     pub async fn ack(&self, ctx: &JobCtx) -> Result<(), LeaseError> {
-        let mut request = Request::new(pb::AckRequest {
+        let body = pb::AckRequest {
             job_id: ctx.id.clone(),
             attempt: ctx.attempt,
             worker_id: self.worker_id.clone(),
-        });
-        inject_metadata(&mut request);
-
-        self.inner.clone().ack(request).await?;
+        };
+        with_retry(&self.retry_policy, "ack", || {
+            let mut request = Request::new(body.clone());
+            inject_metadata(&mut request);
+            let mut inner = self.inner.clone();
+            async move { inner.ack(request).await.map(|_| ()) }
+        })
+        .await?;
         Ok(())
     }
 
@@ -345,7 +403,7 @@ impl SeppClient {
             RetryDirective::After(d) => pb::nack_retry::Strategy::DelayMs(d.as_millis() as u64),
             RetryDirective::DeadLetter => pb::nack_retry::Strategy::DeadLetter(()),
         };
-        let mut request = Request::new(pb::NackRequest {
+        let body = pb::NackRequest {
             job_id: ctx.id.clone(),
             attempt: ctx.attempt,
             reason: Some(reason.into()),
@@ -353,10 +411,15 @@ impl SeppClient {
                 strategy: Some(strategy),
             }),
             worker_id: self.worker_id.clone(),
-        });
-        inject_metadata(&mut request);
+        };
 
-        let response = self.inner.clone().nack(request).await?.into_inner();
+        let response = with_retry(&self.retry_policy, "nack", || {
+            let mut request = Request::new(body.clone());
+            inject_metadata(&mut request);
+            let mut inner = self.inner.clone();
+            async move { inner.nack(request).await.map(|r| r.into_inner()) }
+        })
+        .await?;
         Ok(response.dead_lettered)
     }
 
@@ -379,28 +442,32 @@ impl SeppClient {
         attempt: u32,
         extension: Duration,
     ) -> Result<SystemTime, LeaseError> {
-        let mut request = Request::new(pb::ExtendRequest {
+        let body = pb::ExtendRequest {
             job_id: job_id.to_string(),
             attempt,
             lease_duration_ms: extension.as_millis() as u64,
             worker_id: self.worker_id.clone(),
-        });
-        inject_metadata(&mut request);
+        };
 
-        let response = self.inner.clone().extend(request).await?.into_inner();
+        let response = with_retry(&self.retry_policy, "extend", || {
+            let mut request = Request::new(body.clone());
+            inject_metadata(&mut request);
+            let mut inner = self.inner.clone();
+            async move { inner.extend(request).await.map(|r| r.into_inner()) }
+        })
+        .await?;
         crate::millis_to_system_time(response.lease_expires_at).ok_or_else(|| {
             ClientError::MalformedResponse("extend returned an invalid lease_expires_at").into()
         })
     }
 
     pub async fn get_server_info(&self) -> Result<ServerInfo, ClientError> {
-        let request = Request::new(pb::GetServerInfoRequest {});
-        let response = self
-            .inner
-            .clone()
-            .get_server_info(request)
-            .await?
-            .into_inner();
+        let response = with_retry(&self.retry_policy, "get_server_info", || {
+            let request = Request::new(pb::GetServerInfoRequest {});
+            let mut inner = self.inner.clone();
+            async move { inner.get_server_info(request).await.map(|r| r.into_inner()) }
+        })
+        .await?;
 
         Ok(ServerInfo::try_from(response)?)
     }
@@ -425,7 +492,9 @@ impl Lease {
             client,
             job_id,
             attempt,
-            expiry: Arc::new(AtomicI64::new(crate::system_time_to_millis(lease_expires_at))),
+            expiry: Arc::new(AtomicI64::new(crate::system_time_to_millis(
+                lease_expires_at,
+            ))),
         }
     }
 
@@ -458,6 +527,7 @@ pub struct SeppClientBuilder {
     addr: String,
     api_key: Option<String>,
     worker_id: Option<String>,
+    retry_policy: RetryPolicy,
     #[cfg(feature = "tls")]
     tls: Option<ClientTlsConfig>,
 }
@@ -468,6 +538,7 @@ impl SeppClientBuilder {
             addr: addr.into(),
             api_key: None,
             worker_id: None,
+            retry_policy: RetryPolicy::default(),
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -480,6 +551,11 @@ impl SeppClientBuilder {
 
     pub fn worker_id(mut self, worker_id: impl Into<String>) -> Self {
         self.worker_id = Some(worker_id.into());
+        self
+    }
+
+    pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
         self
     }
 
@@ -522,7 +598,9 @@ impl SeppClientBuilder {
         let tls_enabled = false;
 
         if interceptor.is_enabled() && !tls_enabled {
-            warn!("API key configured without TLS; it will be sent over the connection in plaintext");
+            warn!(
+                "API key configured without TLS; it will be sent over the connection in plaintext"
+            );
         }
 
         let channel = async {
@@ -559,6 +637,7 @@ impl SeppClientBuilder {
         Ok(SeppClient {
             inner: QueueServiceClient::with_interceptor(channel, interceptor),
             worker_id: self.worker_id,
+            retry_policy: Arc::new(self.retry_policy),
         })
     }
 }
@@ -605,6 +684,72 @@ fn root_cause(err: &(dyn std::error::Error + 'static)) -> String {
         current = source;
     }
     current.to_string()
+}
+
+/// Returns whether a gRPC status is worth retrying.
+fn is_transient(status: &Status) -> bool {
+    use tonic::Code;
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::DeadlineExceeded | Code::Aborted | Code::ResourceExhausted
+    )
+}
+
+/// Equal-jitter factor: returns a value in `[0.5, 1.0)`.
+fn jitter_factor() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let mut x = nanos as u64;
+    x ^= x >> 17;
+    x = x.wrapping_mul(0xed5ad4bb);
+    x ^= x >> 11;
+    0.5 + 0.5 * ((x & 0xffff) as f64 / 65536.0)
+}
+
+/// Run `f` repeatedly until it succeeds, runs out of attempts, or hits a
+/// non-transient error. Sleeps between attempts according to `policy`.
+async fn with_retry<F, Fut, T>(
+    policy: &RetryPolicy,
+    operation: &'static str,
+    mut f: F,
+) -> Result<T, Status>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Status>>,
+{
+    let mut attempt: u32 = 1;
+    let mut backoff = policy.initial_backoff;
+    loop {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(status) if attempt >= policy.max_attempts || !is_transient(&status) => {
+                return Err(status);
+            }
+            Err(status) => {
+                let delay = if policy.jitter {
+                    Duration::from_secs_f64(backoff.as_secs_f64() * jitter_factor())
+                } else {
+                    backoff
+                };
+                warn!(
+                    operation,
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    code = ?status.code(),
+                    message = %status.message(),
+                    "retrying after transient error"
+                );
+                tokio::time::sleep(delay).await;
+                backoff = Duration::from_secs_f64(
+                    (backoff.as_secs_f64() * policy.multiplier)
+                        .min(policy.max_backoff.as_secs_f64()),
+                );
+                attempt += 1;
+            }
+        }
+    }
 }
 
 fn inject_metadata<T>(request: &mut Request<T>) {
@@ -841,5 +986,139 @@ mod tests {
         let mut interceptor = ApiKeyInterceptor::disabled();
         let req = interceptor.call(Request::new(())).unwrap();
         assert!(req.metadata().get("authorization").is_none());
+    }
+
+    #[test]
+    fn is_transient_classifies_codes() {
+        assert!(is_transient(&st(Code::Unavailable, "")));
+        assert!(is_transient(&st(Code::DeadlineExceeded, "")));
+        assert!(is_transient(&st(Code::Aborted, "")));
+        assert!(is_transient(&st(Code::ResourceExhausted, "")));
+
+        assert!(!is_transient(&st(Code::Cancelled, "")));
+        assert!(!is_transient(&st(Code::InvalidArgument, "")));
+        assert!(!is_transient(&st(Code::NotFound, "")));
+        assert!(!is_transient(&st(Code::FailedPrecondition, "")));
+        assert!(!is_transient(&st(Code::Unauthenticated, "")));
+        assert!(!is_transient(&st(Code::PermissionDenied, "")));
+        assert!(!is_transient(&st(Code::Internal, "")));
+        assert!(!is_transient(&st(Code::DataLoss, "")));
+        assert!(!is_transient(&st(Code::Unknown, "")));
+    }
+
+    #[test]
+    fn jitter_factor_in_range() {
+        for _ in 0..256 {
+            let f = jitter_factor();
+            assert!((0.5..1.0).contains(&f), "jitter factor out of range: {f}");
+        }
+    }
+
+    fn fast_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy::default()
+            .with_max_attempts(max_attempts)
+            .with_initial_backoff(Duration::from_millis(1))
+            .with_max_backoff(Duration::from_millis(1))
+            .without_jitter()
+    }
+
+    #[tokio::test]
+    async fn with_retry_returns_immediately_on_success() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let result: Result<u32, Status> = with_retry(&fast_policy(5), "test", move || {
+            let calls = calls2.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn with_retry_succeeds_after_transient_failures() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let result: Result<u32, Status> = with_retry(&fast_policy(5), "test", move || {
+            let calls = calls2.clone();
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err(st(Code::Unavailable, "blip"))
+                } else {
+                    Ok(7)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn with_retry_gives_up_after_max_attempts() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let result: Result<(), Status> = with_retry(&fast_policy(3), "test", move || {
+            let calls = calls2.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(st(Code::Unavailable, "still down"))
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code(), Code::Unavailable);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn with_retry_does_not_retry_non_transient_errors() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let result: Result<(), Status> = with_retry(&fast_policy(5), "test", move || {
+            let calls = calls2.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(st(Code::InvalidArgument, "nope"))
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code(), Code::InvalidArgument);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn with_retry_default_policy_runs_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let result: Result<(), Status> = with_retry(&RetryPolicy::default(), "test", move || {
+            let calls = calls2.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(st(Code::Unavailable, "transient"))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retry_policy_max_attempts_clamps_to_one() {
+        let p = RetryPolicy::default().with_max_attempts(0);
+        assert_eq!(p.max_attempts(), 1);
+    }
+
+    #[test]
+    fn retry_policy_default_is_no_retry() {
+        assert_eq!(RetryPolicy::default().max_attempts(), 1);
     }
 }
