@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt,
     time::{Duration, SystemTime},
 };
 
@@ -61,7 +62,7 @@ impl From<bool> for Primitive {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payload {
     pub data: Vec<u8>,
     pub encoding: String,
@@ -76,7 +77,7 @@ impl From<Payload> for crate::pb::sepp::v1::Payload {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Priority(u8);
 
 #[derive(Debug, thiserror::Error)]
@@ -107,7 +108,7 @@ impl TryFrom<u8> for Priority {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TraceContext {
     traceparent: String,
     tracestate: Option<String>,
@@ -289,7 +290,7 @@ impl From<TraceContext> for crate::pb::sepp::v1::TraceContext {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EnqueueRequest {
     queue: String,
     job_type: String,
@@ -392,7 +393,7 @@ impl From<EnqueueRequest> for crate::pb::sepp::v1::EnqueueRequest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BatchOutcome {
     results: Vec<Result<EnqueueAck, JobRejection>>,
 }
@@ -425,7 +426,7 @@ impl BatchOutcome {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnqueueAck {
     pub job_id: String,
     pub deduplicated: bool,
@@ -440,7 +441,7 @@ impl From<crate::pb::sepp::v1::EnqueueResponse> for EnqueueAck {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum JobRejection {
     #[error("queue {queue:?} is not declared on the server (strict mode)")]
@@ -533,7 +534,7 @@ impl From<crate::pb::sepp::v1::JobRejection> for JobRejection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JobValidationError {
     pub index: u32,
     pub rejection: JobRejection,
@@ -563,7 +564,7 @@ impl From<tonic::Status> for AtomicEnqueueError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JobCtx {
     pub id: String,
     pub job_type: String,
@@ -586,7 +587,21 @@ impl JobCtx {
     }
 }
 
-#[derive(Debug)]
+impl fmt::Display for JobCtx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "JobCtx {{ id: {}, job_type: {}, attempt: {}/{}, priority: {} }}",
+            self.id,
+            self.job_type,
+            self.attempt,
+            self.max_attempts,
+            self.priority.get(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Job {
     pub payload: Option<Payload>,
     pub ctx: JobCtx,
@@ -710,7 +725,7 @@ pub(crate) fn job_from_pb(
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReserveOptions {
     queues: Vec<String>,
     wait_timeout: Duration,
@@ -799,11 +814,12 @@ impl From<&ReserveOptions> for crate::pb::sepp::v1::ReserveRequest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServerInfo {
     pub version: String,
     pub supported_protocol_versions: Vec<String>,
     pub server_time: SystemTime,
+    pub restricts_encodings: bool,
     pub allowed_encodings: Vec<String>,
     pub max_payload_size: u64,
     pub max_custom_entries: u32,
@@ -833,6 +849,7 @@ impl TryFrom<crate::pb::sepp::v1::GetServerInfoResponse> for ServerInfo {
             version: r.server_version,
             supported_protocol_versions: r.supported_protocol_versions,
             server_time,
+            restricts_encodings: r.restricts_encodings,
             allowed_encodings: r.allowed_encodings,
             max_payload_size: r.max_payload_bytes,
             max_custom_entries: r.max_custom_entries,
@@ -1756,6 +1773,7 @@ mod tests {
             vec!["v1".to_string()]
         );
         assert_eq!(info.allowed_encodings, vec!["json".to_string()]);
+        assert!(!info.restricts_encodings);
         assert_eq!(info.max_payload_size, 1024);
         assert_eq!(info.max_custom_entries, 10);
         assert_eq!(info.max_custom_total_bytes, 2048);
