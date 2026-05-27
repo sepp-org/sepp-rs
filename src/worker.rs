@@ -2,6 +2,7 @@ use std::{collections::HashMap, panic::AssertUnwindSafe, sync::Arc, time::Durati
 
 use futures::{FutureExt, future::BoxFuture};
 use tokio::{sync::Semaphore, task::AbortHandle};
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
@@ -45,12 +46,34 @@ pub struct Worker {
     max_in_flight: usize,
     reserve_error_backoff: Duration,
     auto_extend: Option<AutoExtend>,
+    shutdown: ShutdownHandle,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct AutoExtend {
     interval: Duration,
     extend_by: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShutdownHandle {
+    token: CancellationToken,
+}
+
+impl ShutdownHandle {
+    fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.token.cancel();
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.token.is_cancelled()
+    }
 }
 
 impl Worker {
@@ -67,7 +90,12 @@ impl Worker {
             max_in_flight: 16,
             reserve_error_backoff: Duration::from_secs(1),
             auto_extend: None,
+            shutdown: ShutdownHandle::new(),
         }
+    }
+
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        self.shutdown.clone()
     }
 
     pub fn with_auto_extend(mut self) -> Self {
@@ -117,9 +145,11 @@ impl Worker {
     }
 
     pub async fn run(self) -> Result<(), ClientError> {
-        let semaphore = Arc::new(Semaphore::new(self.max_in_flight.max(1)));
+        let max_permits = self.max_in_flight.max(1);
+        let semaphore = Arc::new(Semaphore::new(max_permits));
         let handlers = Arc::new(self.handlers);
         let auto_extend = self.auto_extend;
+        let shutdown = self.shutdown.clone();
         info!(
             worker_id = self.client.worker_id().unwrap_or("<none>"),
             max_in_flight = self.max_in_flight,
@@ -128,12 +158,12 @@ impl Worker {
             "worker started"
         );
 
-        loop {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("semaphore is never closed");
+        'outer: loop {
+            let permit = tokio::select! {
+                biased;
+                () = shutdown.token.cancelled() => break 'outer,
+                p = semaphore.clone().acquire_owned() => p.expect("semaphore is never closed"),
+            };
 
             let mut opts = self.opts.clone();
             if let Some(user_max) = opts.max_jobs {
@@ -141,17 +171,28 @@ impl Worker {
                 opts.max_jobs = Some(user_max.min(capacity));
             }
 
-            let jobs = match self.client.reserve(&opts).await {
-                Ok(Some(jobs)) => jobs,
-                Ok(None) => continue, // wait window elapsed — re-poll immediately
-                Err(_err) => {
-                    warn!(
-                        "reserve error: {_err}; backing off for {:?}",
-                        self.reserve_error_backoff
-                    );
-                    tokio::time::sleep(self.reserve_error_backoff).await;
-                    continue;
+            let jobs = tokio::select! {
+                biased;
+                () = shutdown.token.cancelled() => {
+                    drop(permit);
+                    break 'outer;
                 }
+                res = self.client.reserve(&opts) => match res {
+                    Ok(Some(jobs)) => jobs,
+                    Ok(None) => continue, // wait window elapsed — re-poll immediately
+                    Err(_err) => {
+                        warn!(
+                            "reserve error: {_err}; backing off for {:?}",
+                            self.reserve_error_backoff
+                        );
+                        drop(permit);
+                        tokio::select! {
+                            biased;
+                            () = shutdown.token.cancelled() => break 'outer,
+                            () = tokio::time::sleep(self.reserve_error_backoff) => continue,
+                        }
+                    }
+                },
             };
 
             let mut jobs = jobs.into_iter();
@@ -164,6 +205,7 @@ impl Worker {
                     process_job(&client, &handlers, auto_extend, first).await;
                 });
             }
+
             for job in jobs {
                 let permit = semaphore
                     .clone()
@@ -178,6 +220,14 @@ impl Worker {
                 });
             }
         }
+
+        info!("worker shutting down; waiting for in-flight jobs to finish");
+        let _drain = semaphore
+            .acquire_many(max_permits as u32)
+            .await
+            .expect("semaphore is never closed");
+        info!("worker stopped");
+        Ok(())
     }
 }
 
@@ -387,5 +437,48 @@ mod tests {
     fn worker_err_permanent() {
         let e = WorkerError::permanent("bad input");
         assert!(matches!(e, WorkerError::Permanent(s) if s == "bad input"));
+    }
+
+    #[test]
+    fn shutdown_handle_starts_unsignaled() {
+        let h = ShutdownHandle::new();
+        assert!(!h.is_shutdown());
+    }
+
+    #[test]
+    fn shutdown_handle_is_signaled_after_shutdown() {
+        let h = ShutdownHandle::new();
+        h.shutdown();
+        assert!(h.is_shutdown());
+    }
+
+    #[test]
+    fn shutdown_handle_clones_share_state() {
+        let h = ShutdownHandle::new();
+        let h2 = h.clone();
+        h.shutdown();
+        assert!(h2.is_shutdown());
+    }
+
+    #[tokio::test]
+    async fn shutdown_handle_cancelled_resolves_when_already_signaled() {
+        let h = ShutdownHandle::new();
+        h.shutdown();
+        tokio::time::timeout(Duration::from_secs(1), h.token.cancelled())
+            .await
+            .expect("cancelled() should resolve immediately when already signaled");
+    }
+
+    #[tokio::test]
+    async fn shutdown_handle_cancelled_resolves_on_late_signal() {
+        let h = ShutdownHandle::new();
+        let h2 = h.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            h2.shutdown();
+        });
+        tokio::time::timeout(Duration::from_secs(1), h.token.cancelled())
+            .await
+            .expect("cancelled() should be woken by shutdown signal");
     }
 }
