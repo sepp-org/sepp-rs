@@ -68,6 +68,15 @@ pub struct Payload {
     pub encoding: String,
 }
 
+impl Payload {
+    pub fn new(data: Vec<u8>, encoding: impl Into<String>) -> Self {
+        Self {
+            data,
+            encoding: encoding.into(),
+        }
+    }
+}
+
 impl From<Payload> for crate::pb::sepp::v1::Payload {
     fn from(p: Payload) -> Self {
         Self {
@@ -87,6 +96,17 @@ pub struct PriorityOutOfRange(pub u8);
 impl Priority {
     pub const MIN: Self = Self(0);
     pub const MAX: Self = Self(9);
+
+    pub const P0: Self = Self(0);
+    pub const P1: Self = Self(1);
+    pub const P2: Self = Self(2);
+    pub const P3: Self = Self(3);
+    pub const P4: Self = Self(4);
+    pub const P5: Self = Self(5);
+    pub const P6: Self = Self(6);
+    pub const P7: Self = Self(7);
+    pub const P8: Self = Self(8);
+    pub const P9: Self = Self(9);
 
     pub fn new(value: u8) -> Result<Self, PriorityOutOfRange> {
         if value > Self::MAX.0 {
@@ -363,6 +383,15 @@ impl EnqueueRequest {
         self
     }
 
+    pub fn with_custom_entry(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<Primitive>,
+    ) -> Self {
+        self.custom.insert(key.into(), value.into());
+        self
+    }
+
     pub fn with_trace_context(mut self, trace_context: TraceContext) -> Self {
         self.trace_context = Some(trace_context);
         self
@@ -390,39 +419,6 @@ impl From<EnqueueRequest> for crate::pb::sepp::v1::EnqueueRequest {
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64),
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BatchOutcome {
-    results: Vec<Result<EnqueueAck, JobRejection>>,
-}
-
-impl BatchOutcome {
-    pub fn all_succeeded(&self) -> bool {
-        self.results.iter().all(Result::is_ok)
-    }
-
-    pub fn results(&self) -> &[Result<EnqueueAck, JobRejection>] {
-        &self.results
-    }
-
-    pub fn rejected(&self) -> impl Iterator<Item = (usize, &JobRejection)> {
-        self.results
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| r.as_ref().err().map(|e| (i, e)))
-    }
-
-    pub fn succeeded(&self) -> impl Iterator<Item = (usize, &EnqueueAck)> {
-        self.results
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| r.as_ref().ok().map(|a| (i, a)))
-    }
-
-    pub fn into_results(self) -> Vec<Result<EnqueueAck, JobRejection>> {
-        self.results
     }
 }
 
@@ -1198,69 +1194,6 @@ mod tests {
             .with_scheduled_at(SystemTime::UNIX_EPOCH - Duration::from_secs(1));
         let pb: pb::EnqueueRequest = req.into();
         assert!(pb.scheduled_at.is_none());
-    }
-
-    fn ack(id: &str) -> EnqueueAck {
-        EnqueueAck {
-            job_id: id.into(),
-            deduplicated: false,
-        }
-    }
-
-    #[test]
-    fn batch_outcome_all_succeeded_true_when_empty() {
-        let bo = BatchOutcome { results: vec![] };
-        assert!(bo.all_succeeded());
-    }
-
-    #[test]
-    fn batch_outcome_all_succeeded_true() {
-        let bo = BatchOutcome {
-            results: vec![Ok(ack("a")), Ok(ack("b"))],
-        };
-        assert!(bo.all_succeeded());
-    }
-
-    #[test]
-    fn batch_outcome_all_succeeded_false_when_any_err() {
-        let bo = BatchOutcome {
-            results: vec![Ok(ack("a")), Err(JobRejection::Unknown)],
-        };
-        assert!(!bo.all_succeeded());
-    }
-
-    #[test]
-    fn batch_outcome_rejected_indexes() {
-        let bo = BatchOutcome {
-            results: vec![Ok(ack("a")), Err(JobRejection::Unknown), Ok(ack("c"))],
-        };
-        let indexes: Vec<usize> = bo.rejected().map(|(i, _)| i).collect();
-        assert_eq!(indexes, vec![1]);
-    }
-
-    #[test]
-    fn batch_outcome_succeeded_indexes() {
-        let bo = BatchOutcome {
-            results: vec![Ok(ack("a")), Err(JobRejection::Unknown), Ok(ack("c"))],
-        };
-        let indexes: Vec<usize> = bo.succeeded().map(|(i, _)| i).collect();
-        assert_eq!(indexes, vec![0, 2]);
-    }
-
-    #[test]
-    fn batch_outcome_results_borrow() {
-        let bo = BatchOutcome {
-            results: vec![Ok(ack("a"))],
-        };
-        assert_eq!(bo.results().len(), 1);
-    }
-
-    #[test]
-    fn batch_outcome_into_results_yields_inner() {
-        let bo = BatchOutcome {
-            results: vec![Ok(ack("a"))],
-        };
-        assert_eq!(bo.into_results().len(), 1);
     }
 
     #[test]

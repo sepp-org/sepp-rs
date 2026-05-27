@@ -124,7 +124,7 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = done_tx.send(ctx.id.clone()).await;
                 Ok(())
             }
-        });
+        })?;
     let worker_task = tokio::spawn(worker.run());
 
     // 3. Wait for the job to be processed, then tear the worker down.

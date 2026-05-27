@@ -60,7 +60,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let _ = done_tx.send(ctx.id.clone()).await;
             Ok(())
         }
-    });
+    })?;
 
     let worker_task = tokio::spawn(worker.run());
 

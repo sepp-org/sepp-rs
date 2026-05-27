@@ -6,19 +6,28 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
-    Job, JobCtx, Payload, ReserveOptions,
-    client::{ClientError, Lease, LeaseError, RetryDirective, SeppClient},
+    Job, JobCtx, Payload, ReserveOptions, ReserveOptionsError,
+    client::{Lease, LeaseError, RetryDirective, SeppClient},
     now_millis,
 };
 
 type Handler = Arc<
-    dyn Fn(Option<Payload>, Arc<JobCtx>) -> BoxFuture<'static, Result<(), WorkerError>>
+    dyn Fn(Option<Payload>, Arc<JobCtx>) -> BoxFuture<'static, Result<(), HandlerError>>
         + Send
         + Sync,
 >;
 
+fn wrap_handler<F, Fut>(h: F) -> Handler
+where
+    F: Fn(Option<Payload>, Arc<JobCtx>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), HandlerError>> + Send + 'static,
+{
+    let h = Arc::new(h);
+    Arc::new(move |payload, ctx| Box::pin(h(payload, ctx)))
+}
+
 #[derive(Debug, thiserror::Error)]
-pub enum WorkerError {
+pub enum HandlerError {
     #[error("retry: {0}")]
     Retry(String),
     #[error("retry after {1:?}: {0}")]
@@ -27,7 +36,7 @@ pub enum WorkerError {
     Permanent(String),
 }
 
-impl WorkerError {
+impl HandlerError {
     pub fn retry(reason: impl Into<String>) -> Self {
         Self::Retry(reason.into())
     }
@@ -37,6 +46,12 @@ impl WorkerError {
     pub fn permanent(reason: impl Into<String>) -> Self {
         Self::Permanent(reason.into())
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkerBuilderError {
+    #[error("handler for job_type {0:?} is already registered")]
+    DuplicateHandler(String),
 }
 
 pub struct Worker {
@@ -234,25 +249,45 @@ impl Worker {
         self
     }
 
-    pub fn with_worker_id(mut self, worker_id: impl Into<String>) -> Self {
-        self.opts.worker_id = Some(worker_id.into());
-        self
+    pub fn with_worker_id(
+        mut self,
+        worker_id: impl Into<String>,
+    ) -> Result<Self, ReserveOptionsError> {
+        let id = worker_id.into();
+        if id.is_empty() {
+            return Err(ReserveOptionsError::EmptyWorkerId);
+        }
+        self.opts.worker_id = Some(id);
+        Ok(self)
     }
 
-    pub fn handle<F, Fut>(mut self, job_type: &str, h: F) -> Self
+    pub fn handle<F, Fut>(mut self, job_type: &str, h: F) -> Result<Self, WorkerBuilderError>
     where
         F: Fn(Option<Payload>, Arc<JobCtx>) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), WorkerError>> + Send + 'static,
+        Fut: Future<Output = Result<(), HandlerError>> + Send + 'static,
     {
-        let h = Arc::new(h);
-        self.handlers.insert(
-            job_type.to_string(),
-            Arc::new(move |payload, ctx| Box::pin(h(payload, ctx))),
-        );
+        if self.handlers.contains_key(job_type) {
+            return Err(WorkerBuilderError::DuplicateHandler(job_type.to_string()));
+        }
+        self.handlers.insert(job_type.to_string(), wrap_handler(h));
+        Ok(self)
+    }
+
+    pub fn replace_handler<F, Fut>(mut self, job_type: &str, h: F) -> Self
+    where
+        F: Fn(Option<Payload>, Arc<JobCtx>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), HandlerError>> + Send + 'static,
+    {
+        self.handlers.insert(job_type.to_string(), wrap_handler(h));
         self
     }
 
-    pub async fn run(self) -> Result<(), ClientError> {
+    pub fn remove_handler(mut self, job_type: &str) -> Self {
+        self.handlers.remove(job_type);
+        self
+    }
+
+    pub async fn run(self) {
         let max_permits = self.max_in_flight.max(1);
         let semaphore = Arc::new(Semaphore::new(max_permits));
         let handlers = Arc::new(self.handlers);
@@ -349,7 +384,6 @@ impl Worker {
             .await
             .expect("semaphore is never closed");
         info!("worker stopped");
-        Ok(())
     }
 }
 
@@ -439,7 +473,7 @@ async fn run_job(
 }
 
 enum Disposition {
-    Completed(Result<(), WorkerError>),
+    Completed(Result<(), HandlerError>),
     Panicked,
 }
 
@@ -459,9 +493,9 @@ async fn dispose(
         Disposition::Completed(Err(err)) => {
             warn!("handler returned error; nacking: {err}");
             let (retry, reason) = match err {
-                WorkerError::Retry(r) => (RetryDirective::Default, r),
-                WorkerError::RetryAfter(r, d) => (RetryDirective::After(d), r),
-                WorkerError::Permanent(r) => (RetryDirective::DeadLetter, r),
+                HandlerError::Retry(r) => (RetryDirective::Default, r),
+                HandlerError::RetryAfter(r, d) => (RetryDirective::After(d), r),
+                HandlerError::Permanent(r) => (RetryDirective::DeadLetter, r),
             };
             let dead_lettered = client.nack(ctx, retry, reason).await?;
             metrics.record_nacked(dead_lettered);
@@ -550,23 +584,23 @@ mod tests {
 
     #[test]
     fn worker_err_retry() {
-        let e = WorkerError::retry("network");
-        assert!(matches!(e, WorkerError::Retry(s) if s == "network"));
+        let e = HandlerError::retry("network");
+        assert!(matches!(e, HandlerError::Retry(s) if s == "network"));
     }
 
     #[test]
     fn worker_err_retry_after() {
-        let e = WorkerError::retry_after("rate limited", Duration::from_secs(5));
+        let e = HandlerError::retry_after("rate limited", Duration::from_secs(5));
         assert!(matches!(
             e,
-            WorkerError::RetryAfter(s, d) if s == "rate limited" && d == Duration::from_secs(5)
+            HandlerError::RetryAfter(s, d) if s == "rate limited" && d == Duration::from_secs(5)
         ));
     }
 
     #[test]
     fn worker_err_permanent() {
-        let e = WorkerError::permanent("bad input");
-        assert!(matches!(e, WorkerError::Permanent(s) if s == "bad input"));
+        let e = HandlerError::permanent("bad input");
+        assert!(matches!(e, HandlerError::Permanent(s) if s == "bad input"));
     }
 
     #[test]

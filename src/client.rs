@@ -18,7 +18,7 @@ use tonic::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    BatchOutcome, EnqueueRequest, Job, JobConversionError, JobCtx, ReserveOptions,
+    EnqueueRequest, Job, JobConversionError, JobCtx, ReserveOptions,
     pb::sepp::v1::queue_service_client::QueueServiceClient,
 };
 
@@ -221,7 +221,7 @@ impl SeppClient {
     pub async fn enqueue_batch(
         &self,
         jobs: impl IntoIterator<Item = EnqueueRequest>,
-    ) -> Result<BatchOutcome, ClientError> {
+    ) -> Result<Vec<Result<EnqueueAck, JobRejection>>, ClientError> {
         let jobs: Vec<pb::EnqueueRequest> = jobs.into_iter().map(Into::into).collect();
         if jobs.is_empty() {
             return Err(ClientError::EmptyBatch);
@@ -264,15 +264,11 @@ impl SeppClient {
             });
         }
 
-        Ok(BatchOutcome { results })
+        Ok(results)
     }
 
     pub async fn enqueue(&self, job: EnqueueRequest) -> Result<EnqueueAck, EnqueueError> {
-        let mut results = self
-            .enqueue_batch(std::iter::once(job))
-            .await?
-            .into_results()
-            .into_iter();
+        let mut results = self.enqueue_batch(std::iter::once(job)).await?.into_iter();
 
         match results.next() {
             Some(Ok(ack)) => Ok(ack),
