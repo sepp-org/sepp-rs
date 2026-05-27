@@ -35,7 +35,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use sepp_rs::client::SeppClient;
 use sepp_rs::worker::Worker;
-use sepp_rs::{EnqueueRequest, Payload, ReserveOptions};
+use sepp_rs::{EnqueueRequest, Payload};
 
 const QUEUE: &str = "traced-example";
 const JOB_TYPE: &str = "greeting";
@@ -110,9 +110,8 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Run a worker. `process_job` opens the `sepp.process` span and links it
     //    back to the publish span recovered from the job's trace context.
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<String>(1);
-    let opts = ReserveOptions::new([QUEUE], Duration::from_secs(30))?;
 
-    let worker = Worker::new(client.clone(), opts)
+    let worker = Worker::new(client.clone(), [QUEUE], Duration::from_secs(30))?
         .handle(JOB_TYPE, move |payload, ctx| {
             let done_tx = done_tx.clone();
             async move {

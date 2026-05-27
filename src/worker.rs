@@ -52,6 +52,8 @@ impl HandlerError {
 pub enum WorkerBuilderError {
     #[error("handler for job_type {0:?} is already registered")]
     DuplicateHandler(String),
+    #[error(transparent)]
+    ReserveOptions(#[from] ReserveOptionsError),
 }
 
 pub struct Worker {
@@ -201,11 +203,14 @@ impl ShutdownHandle {
 }
 
 impl Worker {
-    pub fn new(client: SeppClient, mut opts: ReserveOptions) -> Self {
-        if opts.worker_id.is_none() {
-            opts.worker_id = Some(default_worker_id());
-        }
-        Self {
+    pub fn new(
+        client: SeppClient,
+        queues: impl IntoIterator<Item = impl Into<String>>,
+        lease_duration: Duration,
+    ) -> Result<Self, WorkerBuilderError> {
+        let mut opts = ReserveOptions::new(queues, lease_duration)?;
+        opts.worker_id = Some(default_worker_id());
+        Ok(Self {
             client,
             opts,
             handlers: HashMap::new(),
@@ -214,7 +219,17 @@ impl Worker {
             auto_extend: None,
             shutdown: ShutdownHandle::new(),
             metrics: Arc::new(Metrics::new()),
-        }
+        })
+    }
+
+    pub fn with_wait_timeout(mut self, wait: Duration) -> Self {
+        self.opts.wait_timeout = wait;
+        self
+    }
+
+    pub fn with_max_jobs(mut self, max: u32) -> Self {
+        self.opts.max_jobs = Some(max);
+        self
     }
 
     pub fn shutdown_handle(&self) -> ShutdownHandle {
@@ -252,10 +267,10 @@ impl Worker {
     pub fn with_worker_id(
         mut self,
         worker_id: impl Into<String>,
-    ) -> Result<Self, ReserveOptionsError> {
+    ) -> Result<Self, WorkerBuilderError> {
         let id = worker_id.into();
         if id.is_empty() {
-            return Err(ReserveOptionsError::EmptyWorkerId);
+            return Err(ReserveOptionsError::EmptyWorkerId.into());
         }
         self.opts.worker_id = Some(id);
         Ok(self)
