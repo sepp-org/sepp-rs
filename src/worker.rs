@@ -411,6 +411,8 @@ async fn process_job(
 ) {
     let span = tracing::info_span!(
         "sepp-rs.process",
+        otel.kind = "consumer",
+        otel.status_code = tracing::field::Empty,
         job_id = %job.ctx.id,
         job_type = %job.ctx.job_type,
         attempt = job.ctx.attempt,
@@ -506,6 +508,7 @@ async fn dispose(
             Ok(())
         }
         Disposition::Completed(Err(err)) => {
+            tracing::Span::current().record("otel.status_code", "error");
             warn!("handler returned error; nacking: {err}");
             let (retry, reason) = match err {
                 HandlerError::Retry(r) => (RetryDirective::Default, r),
@@ -517,6 +520,7 @@ async fn dispose(
             Ok(())
         }
         Disposition::Panicked => {
+            tracing::Span::current().record("otel.status_code", "error");
             error!("handler panicked; nacking");
             let dead_lettered = client
                 .nack(ctx, RetryDirective::Default, "handler panicked")

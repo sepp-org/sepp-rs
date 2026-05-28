@@ -217,7 +217,11 @@ impl SeppClient {
         }
     }
 
-    #[tracing::instrument(name = "sepp-rs.enqueue", skip_all, fields(jobs))]
+    #[tracing::instrument(
+        name = "sepp-rs.enqueue",
+        skip_all,
+        fields(otel.kind = "client", otel.status_code = tracing::field::Empty, jobs)
+    )]
     pub async fn enqueue_batch(
         &self,
         jobs: impl IntoIterator<Item = EnqueueRequest>,
@@ -279,7 +283,11 @@ impl SeppClient {
         }
     }
 
-    #[tracing::instrument(name = "sepp-rs.enqueue_atomic", skip_all, fields(jobs))]
+    #[tracing::instrument(
+        name = "sepp-rs.enqueue_atomic",
+        skip_all,
+        fields(otel.kind = "client", otel.status_code = tracing::field::Empty, jobs)
+    )]
     pub async fn enqueue_atomic(
         &self,
         jobs: impl IntoIterator<Item = EnqueueRequest>,
@@ -325,14 +333,29 @@ impl SeppClient {
         }
     }
 
-    #[tracing::instrument(name = "sepp-rs.reserve", skip_all, fields(jobs, worker_id = opts.worker_id.as_deref().unwrap_or("<none>")))]
+    #[tracing::instrument(
+        name = "sepp-rs.reserve",
+        skip_all,
+        fields(
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            jobs,
+            worker_id = opts.worker_id.as_deref().unwrap_or("<none>"),
+        )
+    )]
     pub async fn reserve(&self, opts: &ReserveOptions) -> Result<Option<Vec<Job>>, ReserveError> {
         let msg = pb::ReserveRequest::from(opts);
         let mut request = Request::new(msg);
         request.set_timeout(opts.wait_timeout() + RESERVE_DEADLINE_SLACK);
         inject_metadata(&mut request);
 
-        let response = self.inner.clone().reserve(request).await?.into_inner();
+        let response = match self.inner.clone().reserve(request).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                tracing::Span::current().record("otel.status_code", "error");
+                return Err(status.into());
+            }
+        };
 
         // A single malformed job must not discard the rest of the batch
         let mut jobs = Vec::with_capacity(response.jobs.len());
@@ -352,7 +375,17 @@ impl SeppClient {
         Ok(Some(jobs))
     }
 
-    #[tracing::instrument(name = "sepp-rs.ack", skip_all, fields(job_id = %ctx.id, attempt = ctx.attempt, worker_id = ctx.lease.worker_id.as_deref().unwrap_or("<none>")))]
+    #[tracing::instrument(
+        name = "sepp-rs.ack",
+        skip_all,
+        fields(
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            job_id = %ctx.id,
+            attempt = ctx.attempt,
+            worker_id = ctx.lease.worker_id.as_deref().unwrap_or("<none>"),
+        )
+    )]
     pub async fn ack(&self, ctx: &JobCtx) -> Result<(), LeaseError> {
         let body = pb::AckRequest {
             job_id: ctx.id.clone(),
@@ -369,7 +402,17 @@ impl SeppClient {
         Ok(())
     }
 
-    #[tracing::instrument(name = "sepp-rs.nack", skip_all, fields(job_id = %ctx.id, attempt = ctx.attempt, worker_id = ctx.lease.worker_id.as_deref().unwrap_or("<none>")))]
+    #[tracing::instrument(
+        name = "sepp-rs.nack",
+        skip_all,
+        fields(
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            job_id = %ctx.id,
+            attempt = ctx.attempt,
+            worker_id = ctx.lease.worker_id.as_deref().unwrap_or("<none>"),
+        )
+    )]
     pub async fn nack(
         &self,
         ctx: &JobCtx,
@@ -418,7 +461,13 @@ impl SeppClient {
     #[tracing::instrument(
         name = "sepp-rs.extend",
         skip_all,
-        fields(job_id = %job_id, attempt, worker_id = worker_id.unwrap_or("<none>"))
+        fields(
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            job_id = %job_id,
+            attempt,
+            worker_id = worker_id.unwrap_or("<none>"),
+        )
     )]
     pub(crate) async fn extend_inner(
         &self,
@@ -446,6 +495,11 @@ impl SeppClient {
         })
     }
 
+    #[tracing::instrument(
+        name = "sepp-rs.get_server_info",
+        skip_all,
+        fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+    )]
     pub async fn get_server_info(&self) -> Result<ServerInfo, ClientError> {
         let response = with_retry(&self.retry_policy, "get_server_info", || {
             let request = Request::new(pb::GetServerInfoRequest {});
@@ -705,6 +759,7 @@ where
         match f().await {
             Ok(v) => return Ok(v),
             Err(status) if attempt >= policy.max_attempts || !is_transient(&status) => {
+                tracing::Span::current().record("otel.status_code", "error");
                 return Err(status);
             }
             Err(status) => {

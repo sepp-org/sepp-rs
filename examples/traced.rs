@@ -21,8 +21,8 @@
 //!     cargo run --example traced --features opentelemetry
 //!
 //! Then open your tracing backend, pick the `sepp-rs-example` service, and open
-//! the most recent `sepp.process` trace. That span carries a *link* back to the
-//! `sepp.publish` span — that is the producer→worker linkage.
+//! the most recent `sepp-rs.process` trace. That span carries a *link* back to
+//! the `sepp-rs.enqueue` span — that is the producer→worker linkage.
 
 use std::time::Duration;
 
@@ -63,7 +63,7 @@ fn init_telemetry() -> SdkTracerProvider {
         .build();
 
     // `with_tracer` is the bridge: every `tracing` span (including sepp-rs's
-    // `sepp.publish` / `sepp.process` spans) becomes an OpenTelemetry span.
+    // `sepp-rs.enqueue` / `sepp-rs.process` spans) becomes an OpenTelemetry span.
     let otel_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("sepp-rs-example"));
 
     tracing_subscriber::registry()
@@ -98,7 +98,7 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("SEPP_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
     let client = SeppClient::connect(addr).await?;
 
-    // 1. Enqueue a job. `enqueue` -> `enqueue_batch` opens the `sepp.publish`
+    // 1. Enqueue a job. `enqueue` -> `enqueue_batch` opens the `sepp-rs.enqueue`
     //    span and stamps its trace context onto the job.
     let job = EnqueueRequest::new(QUEUE, JOB_TYPE)?.with_payload(Payload {
         data: b"hello, sepp".to_vec(),
@@ -107,8 +107,8 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let ack = client.enqueue(job).await?;
     println!("enqueued job {}", ack.job_id);
 
-    // 2. Run a worker. `process_job` opens the `sepp.process` span and links it
-    //    back to the publish span recovered from the job's trace context.
+    // 2. Run a worker. `process_job` opens the `sepp-rs.process` span and links
+    //    it back to the enqueue span recovered from the job's trace context.
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<String>(1);
 
     let worker = Worker::new(client.clone(), [QUEUE], Duration::from_secs(30))?
@@ -118,7 +118,7 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
                 let body = payload
                     .map(|p| String::from_utf8_lossy(&p.data).into_owned())
                     .unwrap_or_default();
-                // This event is recorded inside the `sepp.process` span.
+                // This event is recorded inside the `sepp-rs.process` span.
                 tracing::info!(job_id = %ctx.id, payload = %body, "handling job");
                 let _ = done_tx.send(ctx.id.clone()).await;
                 Ok(())
