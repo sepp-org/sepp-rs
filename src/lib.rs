@@ -1,3 +1,84 @@
+//! A Rust client for the [sepp](https://github.com/sepp-org/sepp) job queue.
+//!
+//! This client provides both halves of the job queue API:
+//!
+//! - **Producers** enqueue jobs with a [`SeppClient`](client::SeppClient) —
+//!   one at a time, in best-effort batches or atomic batches.
+//! - **Consumers** reserve jobs and report their outcome. The low-level
+//!   [`reserve`](client::SeppClient::reserve) /
+//!   [`ack`](client::SeppClient::ack) / [`nack`](client::SeppClient::nack)
+//!   calls give you full manual control, while the high-level
+//!   [`Worker`](worker::Worker) runs the whole reserve → process → ack loop for
+//!   you with bounded concurrency, lease auto-extension, graceful shutdown and
+//!   metrics.
+//!
+//! # Quickstart
+//!
+//! As this crate uses [tonic](https://docs.rs/tonic/latest/tonic/), the client is async only and requires a [tokio runtime](https://docs.rs/tokio/latest/tokio/).
+//!
+//! Enqueue a job, then run a worker that processes it:
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use sepp_rs::client::SeppClient;
+//! use sepp_rs::worker::Worker;
+//! use sepp_rs::{EnqueueRequest, Payload};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let client = SeppClient::connect("http://127.0.0.1:50051").await?;
+//!
+//!     // Producer: enqueue a job onto the `emails` queue.
+//!     let ack = client
+//!         .enqueue(
+//!             EnqueueRequest::new("emails", "send_welcome")?
+//!                 .with_payload(Payload::new(b"{\"user\":42}".to_vec(), "application/json")),
+//!         )
+//!         .await?;
+//!     println!("enqueued job {}", ack.job_id);
+//!
+//!     // Consumer: process `send_welcome` jobs from the `emails` queue. A handler
+//!     // returns `Ok(())` to ack the job, or a `HandlerError` to nack it.
+//!     Worker::new(client, ["emails"], Duration::from_secs(30))?
+//!         .handle("send_welcome", |payload, ctx| async move {
+//!             println!("processing job {}", ctx.id);
+//!             Ok(())
+//!         })?
+//!         .run()
+//!         .await;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Concepts
+//!
+//! **Queues and job types.** Every job is enqueued onto a named queue and
+//! tagged with a `job_type`. Workers reserve from one or more queues and
+//! dispatch each job to the handler registered for its `job_type`.
+//!
+//! **[`Payload`](Payload).** Every job can carry an opaque blob of bytes plus an encoding hint.
+//! You can use this to transport any data you want as long as producers and workers agree on the encoding.
+//! For a primitive key-value map, use [`custom`](EnqueueRequest::with_custom_entry) instead.
+//!
+//! **Leases and redelivery.** A reserved job is leased to the worker for a
+//! bounded duration. The worker must [`ack`](client::SeppClient::ack),
+//! [`nack`](client::SeppClient::nack), or [`extend`](client::SeppClient::extend)
+//! the lease before it expires; otherwise the server redelivers the job to
+//! another worker (with [`attempt`](JobCtx::attempt) incremented) until
+//! `max_attempts` is reached and it is dead-lettered. [`Worker`](worker::Worker)
+//! can extend leases automatically — see
+//! [`with_auto_extend`](worker::Worker::with_auto_extend).
+//!
+//! # Feature flags
+//!
+//! - **`opentelemetry`** *(enabled by default)* — emit OpenTelemetry-compatible
+//!   `tracing` spans and metrics, and propagate W3C trace context from the
+//!   producer's enqueue span to the worker's process span. The host application
+//!   still owns the exporter; see the `traced` example.
+//! - **`tls`** — enable TLS for the transport via the `tls_*` methods on
+//!   [`SeppClientBuilder`](client::SeppClientBuilder).
+
 use std::{
     collections::HashMap,
     fmt,
@@ -9,11 +90,24 @@ mod pb;
 pub mod client;
 pub mod worker;
 
+/// A JSON-primitive value stored in a job's [custom](EnqueueRequest::with_custom)
+/// metadata map.
+///
+/// ```
+/// use sepp_rs::Primitive;
+///
+/// let p: Primitive = "hello".into();
+/// assert_eq!(p, Primitive::String("hello".to_string()));
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum Primitive {
+    /// A UTF-8 string.
     String(String),
+    /// A 64-bit signed integer.
     Int(i64),
+    /// A 64-bit float.
     Double(f64),
+    /// A boolean.
     Bool(bool),
 }
 
@@ -62,13 +156,23 @@ impl From<bool> for Primitive {
     }
 }
 
+/// The opaque body of a job, plus an encoding hint.
+///
+/// The queue never interprets `data`; it only carries the bytes. `encoding`
+/// (for example `"application/json"` or `"text/plain"`) is a hint the producer
+/// sets and the worker reads to decide how to deserialize the bytes. A queue
+/// may restrict which encodings it accepts — see
+/// [`JobRejection::EncodingNotAllowed`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payload {
+    /// The raw payload bytes.
     pub data: Vec<u8>,
+    /// Encoding hint for the worker (e.g. a MIME type).
     pub encoding: String,
 }
 
 impl Payload {
+    /// Creates a payload from its bytes and an encoding hint.
     pub fn new(data: Vec<u8>, encoding: impl Into<String>) -> Self {
         Self {
             data,
@@ -86,28 +190,54 @@ impl From<Payload> for crate::pb::sepp::v1::Payload {
     }
 }
 
+/// A job priority in the range `0..=9`, where higher values are dequeued first.
+///
+/// The type makes the valid range unrepresentable-if-invalid: construct one
+/// with [`Priority::new`], the `TryFrom<u8>` impl, or one of the
+/// [`P0`](Priority::P0)–[`P9`](Priority::P9) constants.
+///
+/// ```
+/// use sepp_rs::Priority;
+///
+/// assert_eq!(Priority::new(7).unwrap(), Priority::P7);
+/// assert!(Priority::new(10).is_err());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Priority(u8);
 
+/// Returned by [`Priority::new`] when the value is greater than 9.
 #[derive(Debug, thiserror::Error)]
 #[error("priority must be 0-9, got {0}")]
 pub struct PriorityOutOfRange(pub u8);
 
 impl Priority {
+    /// The lowest priority (`0`).
     pub const MIN: Self = Self(0);
+    /// The highest priority (`9`).
     pub const MAX: Self = Self(9);
 
+    /// Priority `0` (lowest).
     pub const P0: Self = Self(0);
+    /// Priority `1`.
     pub const P1: Self = Self(1);
+    /// Priority `2`.
     pub const P2: Self = Self(2);
+    /// Priority `3`.
     pub const P3: Self = Self(3);
+    /// Priority `4`.
     pub const P4: Self = Self(4);
+    /// Priority `5`.
     pub const P5: Self = Self(5);
+    /// Priority `6`.
     pub const P6: Self = Self(6);
+    /// Priority `7`.
     pub const P7: Self = Self(7);
+    /// Priority `8`.
     pub const P8: Self = Self(8);
+    /// Priority `9` (highest).
     pub const P9: Self = Self(9);
 
+    /// Creates a priority, returning [`PriorityOutOfRange`] if `value > 9`.
     pub fn new(value: u8) -> Result<Self, PriorityOutOfRange> {
         if value > Self::MAX.0 {
             Err(PriorityOutOfRange(value))
@@ -116,6 +246,7 @@ impl Priority {
         }
     }
 
+    /// Returns the priority as a `u8` in `0..=9`.
     pub fn get(&self) -> u8 {
         self.0
     }
@@ -128,19 +259,34 @@ impl TryFrom<u8> for Priority {
     }
 }
 
+/// A [W3C Trace Context](https://www.w3.org/TR/trace-context/) attached to a
+/// job, used to link a producer's trace to the worker that processes the job.
+///
+/// The `traceparent` is validated on construction. With the `opentelemetry`
+/// feature enabled, [`Worker`](worker::Worker) and the client wire this up
+/// automatically — you only need this type to bridge to or from an external
+/// trace propagation system by hand.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceContext {
     traceparent: String,
     tracestate: Option<String>,
 }
 
+/// Returned by [`TraceContext::new`] when the `traceparent` is not a
+/// well-formed W3C value.
 #[derive(Debug, thiserror::Error)]
 pub enum TraceContextError {
+    /// The `traceparent` string did not match the `version-trace_id-span_id-flags`
+    /// shape; the payload explains which field was wrong.
     #[error("invalid traceparent: {0}")]
     InvalidTraceparent(&'static str),
 }
 
 impl TraceContext {
+    /// Creates a trace context from a W3C `traceparent`, validating its format.
+    ///
+    /// The expected shape is `version-trace_id-span_id-flags`, e.g.
+    /// `00-<32 hex>-<16 hex>-<2 hex>`.
     pub fn new(traceparent: impl Into<String>) -> Result<Self, TraceContextError> {
         let traceparent = traceparent.into();
         validate_traceparent(&traceparent)?;
@@ -150,14 +296,17 @@ impl TraceContext {
         })
     }
 
+    /// Attaches a W3C `tracestate` (vendor-specific trace data).
     pub fn with_tracestate(mut self, ts: impl Into<String>) -> Self {
         self.tracestate = Some(ts.into());
         self
     }
 
+    /// Returns the W3C `traceparent`.
     pub fn traceparent(&self) -> &str {
         &self.traceparent
     }
+    /// Returns the W3C `tracestate`, if one was set.
     pub fn tracestate(&self) -> Option<&str> {
         self.tracestate.as_deref()
     }
@@ -165,6 +314,10 @@ impl TraceContext {
 
 #[cfg(feature = "opentelemetry")]
 impl TraceContext {
+    /// Captures the current OpenTelemetry context as a `TraceContext`, or
+    /// `None` if there is no valid active span.
+    ///
+    /// *Requires the `opentelemetry` feature.*
     pub fn from_current_otel() -> Option<Self> {
         use opentelemetry::propagation::TextMapPropagator;
         use opentelemetry::trace::TraceContextExt;
@@ -186,6 +339,10 @@ impl TraceContext {
         })
     }
 
+    /// Installs this trace context as the current OpenTelemetry context for as
+    /// long as the returned guard is held.
+    ///
+    /// *Requires the `opentelemetry` feature.*
     pub fn attach_to_otel(&self) -> opentelemetry::ContextGuard {
         use opentelemetry::propagation::TextMapPropagator;
         use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -200,6 +357,13 @@ impl TraceContext {
         extracted.attach()
     }
 
+    /// Decodes this trace context into an OpenTelemetry [`SpanContext`], or
+    /// `None` if it does not represent a valid span. Used to add a span *link*
+    /// from the worker's process span back to the producer.
+    ///
+    /// [`SpanContext`]: opentelemetry::trace::SpanContext
+    ///
+    /// *Requires the `opentelemetry` feature.*
     pub fn otel_span_context(&self) -> Option<opentelemetry::trace::SpanContext> {
         use opentelemetry::propagation::TextMapPropagator;
         use opentelemetry::trace::TraceContextExt;
@@ -310,6 +474,29 @@ impl From<TraceContext> for crate::pb::sepp::v1::TraceContext {
     }
 }
 
+/// A job to enqueue, built fluently.
+///
+/// Start with [`EnqueueRequest::new`] (which requires a queue and a job type)
+/// and layer on the optional fields with the `with_*` methods. Pass the result
+/// to [`SeppClient::enqueue`](client::SeppClient::enqueue),
+/// [`enqueue_batch`](client::SeppClient::enqueue_batch), or
+/// [`enqueue_atomic`](client::SeppClient::enqueue_atomic).
+///
+/// ```
+/// use sepp_rs::{EnqueueRequest, Payload, Priority};
+///
+/// # fn build() -> Result<EnqueueRequest, Box<dyn std::error::Error>> {
+/// let req = EnqueueRequest::new("emails", "send_welcome")?
+///     .with_payload(Payload::new(b"{}".to_vec(), "application/json"))
+///     .with_priority(Priority::P7)
+///     .with_idempotency_key("welcome-user-42")
+///     .with_max_attempts(5);
+/// # Ok(req)
+/// # }
+/// ```
+///
+/// Fields left unset fall back to the queue's configured defaults on the
+/// server.
 #[derive(Debug, Clone)]
 pub struct EnqueueRequest {
     queue: String,
@@ -323,15 +510,25 @@ pub struct EnqueueRequest {
     scheduled_at: Option<SystemTime>,
 }
 
+/// Returned by [`EnqueueRequest::new`] when the queue or job type is empty.
+///
+/// These are the only two fields validated client-side; all other constraints
+/// (size limits, allowed encodings, …) are enforced by the server and surface
+/// as a [`JobRejection`].
 #[derive(Debug, thiserror::Error)]
 pub enum EnqueueRequestBuilderError {
+    /// The queue name was empty.
     #[error("queue name must not be empty")]
     EmptyQueue,
+    /// The job type was empty.
     #[error("job type must not be empty")]
     EmptyJobType,
 }
 
 impl EnqueueRequest {
+    /// Begins a request for the given queue and job type.
+    ///
+    /// Both must be non-empty, or [`EnqueueRequestBuilderError`] is returned.
     pub fn new(
         queue: impl Into<String>,
         job_type: impl Into<String>,
@@ -358,31 +555,42 @@ impl EnqueueRequest {
         })
     }
 
+    /// Sets the job's payload.
     pub fn with_payload(mut self, payload: Payload) -> Self {
         self.payload = Some(payload);
         self
     }
 
+    /// Sets a deduplication key. The server drops a duplicate enqueue with the
+    /// same key within the queue's dedup window, returning the existing job's
+    /// id with [`EnqueueAck::deduplicated`] set.
     pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
         self.idempotency_key = Some(key.into());
         self
     }
 
+    /// Overrides the queue's default [`Priority`].
     pub fn with_priority(mut self, priority: Priority) -> Self {
         self.priority = Some(priority);
         self
     }
 
+    /// Overrides the queue's default maximum delivery attempts before the job
+    /// is dead-lettered.
     pub fn with_max_attempts(mut self, attempts: u32) -> Self {
         self.max_attempts = Some(attempts);
         self
     }
 
+    /// Replaces the custom metadata map wholesale. See
+    /// [`with_custom_entry`](Self::with_custom_entry) to add one key at a time.
     pub fn with_custom(mut self, custom: HashMap<String, Primitive>) -> Self {
         self.custom = custom; // This is cheap enough that Optional is not needed
         self
     }
 
+    /// Inserts a single custom metadata entry. Any type that converts into a
+    /// [`Primitive`] (`&str`, `i64`, `bool`, …) is accepted as the value.
     pub fn with_custom_entry(
         mut self,
         key: impl Into<String>,
@@ -392,11 +600,20 @@ impl EnqueueRequest {
         self
     }
 
+    /// Attaches a [`TraceContext`] to the job.
+    ///
+    /// With the `opentelemetry` feature, the current span's context is injected
+    /// automatically at enqueue time, so set this only to override that or to
+    /// propagate a trace captured elsewhere.
     pub fn with_trace_context(mut self, trace_context: TraceContext) -> Self {
         self.trace_context = Some(trace_context);
         self
     }
 
+    /// Delays the job until the given time. The job is not delivered to any
+    /// worker before then. Must be within the server's
+    /// [`max_schedule_horizon_ms`](ServerInfo::max_schedule_horizon_ms), or the
+    /// job is rejected with [`JobRejection::ScheduledTooFar`].
     pub fn with_scheduled_at(mut self, scheduled_at: SystemTime) -> Self {
         self.scheduled_at = Some(scheduled_at);
         self
@@ -422,9 +639,14 @@ impl From<EnqueueRequest> for crate::pb::sepp::v1::EnqueueRequest {
     }
 }
 
+/// Confirmation that a job was accepted by the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnqueueAck {
+    /// The server-assigned job id (a UUID). When `deduplicated` is `true`, this
+    /// is the id of the pre-existing job.
     pub job_id: String,
+    /// `true` if an [idempotency key](EnqueueRequest::with_idempotency_key)
+    /// matched an existing job, so this enqueue was a no-op.
     pub deduplicated: bool,
 }
 
@@ -437,43 +659,76 @@ impl From<crate::pb::sepp::v1::EnqueueResponse> for EnqueueAck {
     }
 }
 
+/// Why the server refused a single job.
+///
+/// Every variant is *deterministic*: re-sending the same job against the same
+/// server state produces the same rejection. Transient problems (a storage
+/// outage, a dropped connection) are never reported here — they surface as a
+/// [`ClientError`](client::ClientError) instead. Most limits behind these
+/// variants are advertised up front by [`ServerInfo`], so a producer can
+/// validate locally before sending.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum JobRejection {
+    /// The server is in [strict mode](ServerInfo::strict_queues) and the target
+    /// queue has not been declared.
     #[error("queue {queue:?} is not declared on the server (strict mode)")]
     UnknownQueue { queue: String },
+    /// The payload exceeds the queue's
+    /// [`max_payload_size`](ServerInfo::max_payload_size).
     #[error("payload size {actual} bytes exceeds the queue limit of {limit}")]
     PayloadTooLarge { limit: u64, actual: u64 },
+    /// The queue restricts encodings and the payload's encoding is not on the
+    /// allow-list.
     #[error("payload encoding {encoding:?} is not allowed; accepted: {allowed:?}")]
     EncodingNotAllowed {
         encoding: String,
         allowed: Vec<String>,
     },
+    /// The queue restricts job types and this one is not on the allow-list.
     #[error("job_type {job_type:?} is not accepted by this queue; accepted: {allowed:?}")]
     JobTypeNotAllowed {
         job_type: String,
         allowed: Vec<String>,
     },
+    /// The custom map has more entries than
+    /// [`max_custom_entries`](ServerInfo::max_custom_entries).
     #[error("custom map has {actual} entries, exceeding the queue limit of {limit}")]
     CustomEntriesTooMany { limit: u32, actual: u32 },
+    /// The custom map's total size exceeds
+    /// [`max_custom_total_bytes`](ServerInfo::max_custom_total_bytes).
     #[error("custom map's total size {actual} bytes exceeds the queue limit of {limit}")]
     CustomMapTooLarge { limit: u64, actual: u64 },
+    /// A custom key exceeds
+    /// [`max_custom_key_bytes`](ServerInfo::max_custom_key_bytes).
     #[error("custom key {key:?} is {actual} bytes, exceeding the limit of {limit}")]
     CustomKeyTooLong {
         key: String,
         limit: u32,
         actual: u64,
     },
+    /// The queue name exceeds
+    /// [`max_queue_name_bytes`](ServerInfo::max_queue_name_bytes).
     #[error("queue name is {actual} bytes, exceeding the limit of {limit}")]
     QueueNameTooLong { limit: u32, actual: u64 },
+    /// The job type exceeds
+    /// [`max_job_type_bytes`](ServerInfo::max_job_type_bytes).
     #[error("job_type is {actual} bytes, exceeding the limit of {limit}")]
     JobTypeNameTooLong { limit: u32, actual: u64 },
+    /// The idempotency key exceeds
+    /// [`max_idempotency_key_bytes`](ServerInfo::max_idempotency_key_bytes).
     #[error("idempotency_key is {actual} bytes, exceeding the limit of {limit}")]
     IdempotencyKeyTooLong { limit: u32, actual: u64 },
+    /// [`scheduled_at`](EnqueueRequest::with_scheduled_at) is further out than
+    /// [`max_schedule_horizon_ms`](ServerInfo::max_schedule_horizon_ms).
     #[error("scheduled_at {actual_ms}ms is beyond max_schedule_horizon_ms ({horizon_ms}ms)")]
     ScheduledTooFar { horizon_ms: u64, actual_ms: i64 },
+    /// The request failed the server's structural validation (e.g. a required
+    /// field was missing); `message` carries the detail.
     #[error("structural validation failed: {message}")]
     InvalidRequest { message: String },
+    /// The server sent a rejection reason this client version does not
+    /// recognize.
     #[error("server returned an unrecognized rejection variant")]
     Unknown,
 }
@@ -530,9 +785,16 @@ impl From<crate::pb::sepp::v1::JobRejection> for JobRejection {
     }
 }
 
+/// A single job's rejection within an atomic batch, paired with its position
+/// in the request so the caller can identify which job failed.
+///
+/// Collected into [`AtomicEnqueueError::Validation`] when
+/// [`enqueue_atomic`](client::SeppClient::enqueue_atomic) rejects a batch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobValidationError {
+    /// Zero-based position of the offending job in the submitted batch.
     pub index: u32,
+    /// Why that job was rejected.
     pub rejection: JobRejection,
 }
 
@@ -548,11 +810,20 @@ impl From<crate::pb::sepp::v1::JobValidationError> for JobValidationError {
     }
 }
 
+/// The error type of [`enqueue_atomic`](client::SeppClient::enqueue_atomic).
+///
+/// An atomic batch is all-or-nothing: if any job fails validation, *none* are
+/// enqueued and every failure is reported together in [`Validation`].
+///
+/// [`Validation`]: AtomicEnqueueError::Validation
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AtomicEnqueueError {
+    /// The call failed at the transport or protocol level; nothing about
+    /// individual jobs is known.
     #[error(transparent)]
     Client(#[from] crate::client::ClientError),
+    /// One or more jobs failed validation, so the whole batch was rejected.
     #[error("atomic batch rejected: {} job(s) failed validation", _0.len())]
     Validation(Vec<JobValidationError>),
 }
@@ -563,21 +834,44 @@ impl From<tonic::Status> for AtomicEnqueueError {
     }
 }
 
+/// Everything about a reserved job except its payload: identity, delivery
+/// metadata, and the handle needed to manage its lease.
+///
+/// A handler receives this as `Arc<JobCtx>` alongside the payload. It also
+/// carries an internal lease handle, which is why [`extend`](JobCtx::extend)
+/// can be called directly on it.
 #[derive(Debug, Clone)]
 pub struct JobCtx {
+    /// Server-assigned job id (a UUID).
     pub id: String,
+    /// The job type, used to route to a handler.
     pub job_type: String,
+    /// The job's effective priority.
     pub priority: Priority,
+    /// Which delivery attempt this is, starting at `1` and incremented on each
+    /// redelivery.
     pub attempt: u32,
+    /// The maximum attempts before the job is dead-lettered.
     pub max_attempts: u32,
+    /// When the producer enqueued the job.
     pub enqueued_at: SystemTime,
+    /// Custom metadata the producer attached.
     pub custom: HashMap<String, Primitive>,
+    /// The producer's trace context, if any and if it was well-formed.
     pub trace_context: Option<TraceContext>,
+    /// When the current lease expires. The job must be acked, nacked, or
+    /// extended before this, or it will be redelivered.
     pub lease_expires_at: SystemTime,
     pub(crate) lease: crate::client::Lease,
 }
 
 impl JobCtx {
+    /// Extends this job's lease by `extension`, measured from now, and returns
+    /// the new expiry.
+    ///
+    /// Use this from inside a handler that needs more time than the original
+    /// lease allowed. A [`Worker`](worker::Worker) configured with
+    /// [`with_auto_extend`](worker::Worker::with_auto_extend) does this for you.
     pub async fn extend(
         &self,
         extension: Duration,
@@ -600,20 +894,39 @@ impl fmt::Display for JobCtx {
     }
 }
 
+/// A reserved job: its optional [`Payload`] and its [`JobCtx`].
+///
+/// Returned in batches by [`SeppClient::reserve`](client::SeppClient::reserve).
+/// Under a [`Worker`](worker::Worker), the payload and an `Arc<JobCtx>` are
+/// passed to your handler directly, so you usually deal with the two halves
+/// rather than this struct.
 #[derive(Debug, Clone)]
 pub struct Job {
+    /// The job's payload, if it has one.
     pub payload: Option<Payload>,
+    /// The job's identity, delivery metadata, and lease handle.
     pub ctx: JobCtx,
 }
 
+/// Returned when a job received from the server cannot be decoded into a
+/// [`Job`].
+///
+/// During [`reserve`](client::SeppClient::reserve) this is logged and the
+/// offending job is skipped rather than failing the whole batch, so you
+/// normally only encounter it indirectly.
 #[derive(Debug, thiserror::Error)]
 pub enum JobConversionError {
+    /// A required field (named in the payload) was absent or empty.
     #[error("job is missing required field `{0}`")]
     MissingField(&'static str),
+    /// The priority was outside `0..=9`.
     #[error("job priority {0} is out of range (expected 0-9)")]
     PriorityOutOfRange(u32),
+    /// A timestamp field held a value that is not a representable
+    /// [`SystemTime`].
     #[error("job timestamp `{field}` is not a representable time ({value}ms)")]
     InvalidTimestamp { field: &'static str, value: i64 },
+    /// A custom map entry was present but carried no value.
     #[error("custom value for key `{0}` has no value set")]
     EmptyCustomValue(String),
 }
@@ -730,6 +1043,11 @@ pub(crate) fn job_from_pb(
     })
 }
 
+/// Parameters for a [`reserve`](client::SeppClient::reserve) call.
+///
+/// Constructed with [`ReserveOptions::new`] (which needs the queues to pull
+/// from and the lease duration) and refined with the `with_*` methods. If you
+/// use a [`Worker`](worker::Worker), it builds and manages these for you.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReserveOptions {
     queues: Vec<String>,
@@ -739,19 +1057,32 @@ pub struct ReserveOptions {
     max_jobs: Option<u32>,
 }
 
+/// Returned by [`ReserveOptions`] constructors and setters on invalid input.
 #[derive(Debug, thiserror::Error)]
 pub enum ReserveOptionsError {
+    /// No queues were given.
     #[error("at least one queue must be specified")]
     EmptyQueues,
+    /// The queue name at this index was empty.
     #[error("queue name at index {0} must not be empty")]
     EmptyQueueName(usize),
+    /// The lease duration was zero.
     #[error("lease_duration must be at least 1ms")]
     LeaseDurationTooShort,
+    /// A worker id was supplied but empty.
     #[error("worker_id must not be empty when set")]
     EmptyWorkerId,
 }
 
 impl ReserveOptions {
+    /// Begins reserve options for the given queues and lease duration.
+    ///
+    /// Queues are polled in order: index 0 first, then index 1, and so on. The
+    /// lease duration is how long a returned job is held before it must be
+    /// acked, nacked, or extended. The wait timeout defaults to 30s; override
+    /// it with [`with_wait_timeout`](Self::with_wait_timeout).
+    ///
+    /// At least one non-empty queue and a non-zero lease are required.
     pub fn new(
         queues: impl IntoIterator<Item = impl Into<String>>,
         lease_duration: Duration,
@@ -777,15 +1108,21 @@ impl ReserveOptions {
         })
     }
 
+    /// Sets how long the server holds the connection open waiting for a job
+    /// before returning empty. The server clamps this to its configured
+    /// [`max_wait_timeout_ms`](ServerInfo::max_wait_timeout_ms).
     pub fn with_wait_timeout(mut self, wait: Duration) -> Self {
         self.wait_timeout = wait;
         self
     }
 
+    /// Returns the configured long-poll wait timeout.
     pub fn wait_timeout(&self) -> Duration {
         self.wait_timeout
     }
 
+    /// Sets a stable worker identifier, recorded server-side for observability.
+    /// Must be non-empty.
     pub fn with_worker_id(mut self, id: impl Into<String>) -> Result<Self, ReserveOptionsError> {
         let id = id.into();
         if id.is_empty() {
@@ -795,6 +1132,9 @@ impl ReserveOptions {
         Ok(self)
     }
 
+    /// Sets the maximum number of jobs to return in one response (default 1).
+    /// The server clamps this to its
+    /// [`max_reserve_batch`](ServerInfo::max_reserve_batch).
     pub fn with_max_jobs(mut self, max: u32) -> Self {
         self.max_jobs = Some(max);
         self
@@ -819,33 +1159,67 @@ impl From<&ReserveOptions> for crate::pb::sepp::v1::ReserveRequest {
     }
 }
 
+/// The server's version, capabilities, and limits, as returned by
+/// [`get_server_info`](client::SeppClient::get_server_info).
+///
+/// The various `max_*` fields mirror the limits behind the [`JobRejection`]
+/// variants. Fetching this once at startup lets a producer validate jobs
+/// locally and avoid round-trips that would only be rejected. The limits are
+/// the server's *defaults*; an individual queue may be configured more or less
+/// strictly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerInfo {
+    /// Server version (a semver string).
     pub version: String,
+    /// Protocol versions the server supports.
     pub supported_protocol_versions: Vec<String>,
+    /// The server's current wall-clock time, useful for detecting clock skew.
     pub server_time: SystemTime,
+    /// If `true`, only encodings in [`allowed_encodings`](Self::allowed_encodings)
+    /// are accepted; if `false`, any encoding is accepted.
     pub restricts_encodings: bool,
+    /// The accepted encodings when [`restricts_encodings`](Self::restricts_encodings)
+    /// is set.
     pub allowed_encodings: Vec<String>,
+    /// Maximum payload size in bytes (→ [`JobRejection::PayloadTooLarge`]).
     pub max_payload_size: u64,
+    /// Maximum entries in the custom map (→ [`JobRejection::CustomEntriesTooMany`]).
     pub max_custom_entries: u32,
+    /// Maximum total bytes across the custom map (→ [`JobRejection::CustomMapTooLarge`]).
     pub max_custom_total_bytes: u64,
+    /// Maximum bytes in a single custom key (→ [`JobRejection::CustomKeyTooLong`]).
     pub max_custom_key_bytes: u32,
+    /// Maximum bytes in a queue name (→ [`JobRejection::QueueNameTooLong`]).
     pub max_queue_name_bytes: u32,
+    /// Maximum bytes in a job type (→ [`JobRejection::JobTypeNameTooLong`]).
     pub max_job_type_bytes: u32,
+    /// Maximum bytes in an idempotency key (→ [`JobRejection::IdempotencyKeyTooLong`]).
     pub max_idempotency_key_bytes: u32,
+    /// How far ahead a job may be scheduled, in ms (→ [`JobRejection::ScheduledTooFar`]).
     pub max_schedule_horizon_ms: u64,
+    /// Maximum jobs in one enqueue batch; larger batches fail the whole request.
     pub max_enqueue_batch: u32,
+    /// Maximum jobs returned by one reserve; larger requests are clamped, not rejected.
     pub max_reserve_batch: u32,
+    /// Maximum queues one reserve may list; exceeding this is an error.
     pub max_reserve_queues: u32,
+    /// Maximum long-poll wait in ms; larger requests are clamped.
     pub max_wait_timeout_ms: u64,
+    /// Maximum lease duration in ms; larger requests are clamped.
     pub max_lease_duration_ms: u64,
+    /// If `true`, enqueueing to an undeclared queue is rejected with
+    /// [`JobRejection::UnknownQueue`]; if `false`, queues are created on demand.
     pub strict_queues: bool,
 }
 
+/// Returned when a [`get_server_info`](client::SeppClient::get_server_info)
+/// response cannot be decoded into a [`ServerInfo`].
 #[derive(Debug, thiserror::Error)]
 pub enum ServerInfoError {
+    /// A required field (named in the payload) was absent.
     #[error("server info is missing required field `{0}`")]
     MissingField(&'static str),
+    /// `server_time_ms` was not a representable [`SystemTime`].
     #[error("server_time_ms is not a representable time ({0}ms)")]
     InvalidServerTime(i64),
 }

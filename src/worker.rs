@@ -1,3 +1,40 @@
+//! A high-level worker that runs the reserve → process → ack/nack loop.
+//!
+//! [`Worker`] wraps a [`SeppClient`] and drives job consumption for you:
+//! reserve jobs, dispatch each to the handler registered for its `job_type`,
+//! and ack on success or nack on failure. It adds bounded concurrency, optional
+//! lease auto-extension, graceful shutdown via a [`ShutdownHandle`], and (with
+//! the `opentelemetry` feature) metrics and trace linkage.
+//!
+//! Register handlers with [`Worker::handle`], then call [`Worker::run`]:
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use sepp_rs::client::SeppClient;
+//! use sepp_rs::worker::{HandlerError, Worker};
+//!
+//! # async fn run(client: SeppClient) -> Result<(), Box<dyn std::error::Error>> {
+//! Worker::new(client, ["emails"], Duration::from_secs(30))?
+//!     .with_max_in_flight(32)
+//!     .with_auto_extend()
+//!     .handle("send_welcome", |payload, ctx| async move {
+//!         // ... do the work ...
+//!         Ok(())
+//!     })?
+//!     .handle("send_receipt", |payload, ctx| async move {
+//!         Err(HandlerError::retry("payment service unavailable"))
+//!     })?
+//!     .run()
+//!     .await;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A handler's return value decides the job's fate: `Ok(())` acks it, and an
+//! [`Err`] of [`HandlerError`] nacks it with the corresponding
+//! [`RetryDirective`]. A handler that panics is
+//! caught and nacked rather than bringing the worker down.
+
 use std::{collections::HashMap, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use futures::{FutureExt, future::BoxFuture};
@@ -26,36 +63,68 @@ where
     Arc::new(move |payload, ctx| Box::pin(h(payload, ctx)))
 }
 
+/// The error a job handler returns to nack its job, choosing how it should be
+/// retried.
+///
+/// Each variant maps to a [`RetryDirective`]:
+/// [`Retry`](Self::Retry) → `Default`, [`RetryAfter`](Self::RetryAfter) →
+/// `After`, [`Permanent`](Self::Permanent) → `DeadLetter`. Use the
+/// [`retry`](Self::retry), [`retry_after`](Self::retry_after), and
+/// [`permanent`](Self::permanent) constructors rather than the variants
+/// directly.
 #[derive(Debug, thiserror::Error)]
 pub enum HandlerError {
+    /// Retry using the queue's default retry policy.
     #[error("retry: {0}")]
     Retry(String),
+    /// Retry, but not before the given delay.
     #[error("retry after {1:?}: {0}")]
     RetryAfter(String, Duration),
+    /// Do not retry; dead-letter the job immediately.
     #[error("permanent: {0}")]
     Permanent(String),
 }
 
 impl HandlerError {
+    /// Nack the job for retry under the queue's default policy.
     pub fn retry(reason: impl Into<String>) -> Self {
         Self::Retry(reason.into())
     }
+    /// Nack the job for retry after at least `delay`.
     pub fn retry_after(reason: impl Into<String>, delay: Duration) -> Self {
         Self::RetryAfter(reason.into(), delay)
     }
+    /// Nack the job as a permanent failure, sending it straight to the
+    /// dead-letter queue.
     pub fn permanent(reason: impl Into<String>) -> Self {
         Self::Permanent(reason.into())
     }
 }
 
+/// Returned by the [`Worker`] builder methods on invalid configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerBuilderError {
+    /// [`handle`](Worker::handle) was called twice for the same job type. Use
+    /// [`replace_handler`](Worker::replace_handler) to overwrite intentionally.
     #[error("handler for job_type {0:?} is already registered")]
     DuplicateHandler(String),
+    /// The underlying [`ReserveOptions`] were invalid (e.g. an empty queue or
+    /// worker id).
     #[error(transparent)]
     ReserveOptions(#[from] ReserveOptionsError),
 }
 
+/// A job-processing loop built on a [`SeppClient`].
+///
+/// Configure it fluently — queues and lease duration via [`new`](Self::new),
+/// then `with_*` tuning and one [`handle`](Self::handle) call per job type —
+/// and start it with [`run`](Self::run). `run` consumes the worker and only
+/// returns after a [`ShutdownHandle`] is triggered and in-flight jobs have
+/// drained.
+///
+/// Each reserved job runs on its own task, bounded by
+/// [`with_max_in_flight`](Self::with_max_in_flight). A job whose `job_type` has
+/// no registered handler is nacked for retry.
 pub struct Worker {
     client: SeppClient,
     opts: ReserveOptions,
@@ -181,6 +250,13 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// A cloneable handle for triggering a [`Worker`]'s graceful shutdown.
+///
+/// Obtain one from [`Worker::shutdown_handle`] *before* calling
+/// [`Worker::run`] (which consumes the worker). Calling
+/// [`shutdown`](Self::shutdown) stops new reservations; `run` then waits for
+/// in-flight jobs to finish before returning. Clones share the same signal, so
+/// you can hand a handle to a signal-handler task.
 #[derive(Debug, Clone)]
 pub struct ShutdownHandle {
     token: CancellationToken,
@@ -193,16 +269,26 @@ impl ShutdownHandle {
         }
     }
 
+    /// Signals the worker to stop reserving new jobs and begin draining.
     pub fn shutdown(&self) {
         self.token.cancel();
     }
 
+    /// Returns whether shutdown has been signalled.
     pub fn is_shutdown(&self) -> bool {
         self.token.is_cancelled()
     }
 }
 
 impl Worker {
+    /// Creates a worker that reserves from `queues` with the given lease
+    /// duration.
+    ///
+    /// Sensible defaults are applied: up to 16 jobs in flight, a 1s backoff
+    /// after a failed reserve, no lease auto-extension, and a generated
+    /// [`worker_id`](Self::with_worker_id) derived from the hostname and PID.
+    /// Register at least one handler with [`handle`](Self::handle) before
+    /// [`run`](Self::run).
     pub fn new(
         client: SeppClient,
         queues: impl IntoIterator<Item = impl Into<String>>,
@@ -222,20 +308,35 @@ impl Worker {
         })
     }
 
+    /// Sets the long-poll wait timeout for each reserve. See
+    /// [`ReserveOptions::with_wait_timeout`].
     pub fn with_wait_timeout(mut self, wait: Duration) -> Self {
         self.opts.wait_timeout = wait;
         self
     }
 
+    /// Caps how many jobs a single reserve may return. The worker already
+    /// limits this to its free in-flight capacity, so set this only to request
+    /// fewer.
     pub fn with_max_jobs(mut self, max: u32) -> Self {
         self.opts.max_jobs = Some(max);
         self
     }
 
+    /// Returns a [`ShutdownHandle`] for stopping the worker. Obtain it before
+    /// calling [`run`](Self::run), which consumes `self`.
     pub fn shutdown_handle(&self) -> ShutdownHandle {
         self.shutdown.clone()
     }
 
+    /// Enables automatic lease extension while a handler runs, using a
+    /// heartbeat interval of one third of the lease duration. Use with caution:
+    /// if the handler hangs indefinitely, the lease will be extended forever.
+    ///
+    /// With this on, long-running handlers keep their lease alive without
+    /// calling [`JobCtx::extend`](crate::JobCtx::extend) themselves. If the
+    /// server reassigns the lease anyway, the handler task is aborted to avoid
+    /// double processing.
     pub fn with_auto_extend(mut self) -> Self {
         let lease = self.opts.lease_duration;
         self.auto_extend = Some(AutoExtend {
@@ -245,6 +346,9 @@ impl Worker {
         self
     }
 
+    /// Like [`with_auto_extend`](Self::with_auto_extend) but with an explicit
+    /// heartbeat interval (floored at 1ms). The interval should be comfortably
+    /// shorter than the lease duration.
     pub fn with_auto_extend_interval(mut self, interval: Duration) -> Self {
         let lease = self.opts.lease_duration;
         self.auto_extend = Some(AutoExtend {
@@ -254,16 +358,21 @@ impl Worker {
         self
     }
 
+    /// Sets the maximum number of jobs processed concurrently (default 16).
+    /// Values below 1 are treated as 1.
     pub fn with_max_in_flight(mut self, max_in_flight: usize) -> Self {
         self.max_in_flight = max_in_flight;
         self
     }
 
+    /// Sets how long to wait after a failed reserve before retrying (default
+    /// 1s), preventing a hot loop when the server is unreachable.
     pub fn with_reserve_error_backoff(mut self, backoff: Duration) -> Self {
         self.reserve_error_backoff = backoff;
         self
     }
 
+    /// Overrides the auto-generated worker id. Must be non-empty.
     pub fn with_worker_id(
         mut self,
         worker_id: impl Into<String>,
@@ -276,6 +385,12 @@ impl Worker {
         Ok(self)
     }
 
+    /// Registers the handler for a `job_type`.
+    ///
+    /// The handler receives the job's optional [`Payload`] and an
+    /// `Arc<JobCtx>`, and returns `Ok(())` to ack or a [`HandlerError`] to
+    /// nack. Returns [`WorkerBuilderError::DuplicateHandler`] if a handler is
+    /// already registered for this type.
     pub fn handle<F, Fut>(mut self, job_type: &str, h: F) -> Result<Self, WorkerBuilderError>
     where
         F: Fn(Option<Payload>, Arc<JobCtx>) -> Fut + Send + Sync + 'static,
@@ -288,6 +403,8 @@ impl Worker {
         Ok(self)
     }
 
+    /// Registers a handler, overwriting any existing one for the same
+    /// `job_type` instead of erroring.
     pub fn replace_handler<F, Fut>(mut self, job_type: &str, h: F) -> Self
     where
         F: Fn(Option<Payload>, Arc<JobCtx>) -> Fut + Send + Sync + 'static,
@@ -297,11 +414,21 @@ impl Worker {
         self
     }
 
+    /// Unregisters the handler for a `job_type`, if any. Jobs of an unhandled
+    /// type are nacked for retry.
     pub fn remove_handler(mut self, job_type: &str) -> Self {
         self.handlers.remove(job_type);
         self
     }
 
+    /// Runs the reserve → process → ack/nack loop until shutdown.
+    ///
+    /// Consumes the worker and does not return until a [`ShutdownHandle`] is
+    /// triggered *and* all in-flight jobs have finished draining. Reserve
+    /// errors are logged and retried after
+    /// [`with_reserve_error_backoff`](Self::with_reserve_error_backoff); they do
+    /// not stop the loop. Take a [`shutdown_handle`](Self::shutdown_handle)
+    /// beforehand to be able to stop it.
     pub async fn run(self) {
         let max_permits = self.max_in_flight.max(1);
         let semaphore = Arc::new(Semaphore::new(max_permits));

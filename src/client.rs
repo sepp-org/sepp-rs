@@ -1,3 +1,15 @@
+//! The gRPC client: connecting, enqueuing, reserving, and lease management.
+//!
+//! [`SeppClient`] is a cheaply-cloneable handle to a Sepp server. Build one with
+//! [`SeppClient::connect`] for the common case, or [`SeppClient::builder`] to
+//! configure authentication, TLS, and an RPC [`RetryPolicy`]. All RPC methods
+//! take `&self`, so a single client can be shared across tasks by cloning.
+//!
+//! For consuming jobs you can call [`reserve`](SeppClient::reserve),
+//! [`ack`](SeppClient::ack), [`nack`](SeppClient::nack), and
+//! [`extend`](SeppClient::extend) directly, or hand the client to a
+//! [`Worker`](crate::worker::Worker) and let it drive that loop.
+
 use crate::{EnqueueAck, JobRejection, ServerInfo, ServerInfoError, pb::sepp::v1 as pb};
 use std::{
     sync::{
@@ -26,6 +38,11 @@ const RESERVE_DEADLINE_SLACK: Duration = Duration::from_secs(10);
 
 type AuthChannel = InterceptedService<Channel, ApiKeyInterceptor>;
 
+/// A handle to a Sepp server.
+///
+/// Cloning is cheap — clones share the same underlying connection and retry
+/// policy — so clone freely to use the client across tasks. Every RPC method
+/// takes `&self`.
 #[derive(Clone)]
 pub struct SeppClient {
     inner: QueueServiceClient<AuthChannel>,
@@ -37,33 +54,56 @@ const _: fn() = || {
     assert_send_sync::<SeppClient>();
 };
 
+/// The general client error type, shared by most RPCs.
+///
+/// gRPC status codes are mapped onto these variants: `Unavailable` /
+/// `DeadlineExceeded` / `Aborted` / `Cancelled` become [`Transport`](Self::Transport),
+/// `ResourceExhausted` becomes [`Overloaded`](Self::Overloaded), and so on. The
+/// transport-ish variants are the ones the [`RetryPolicy`] retries.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClientError {
+    /// Establishing the connection failed.
     #[error("could not connect to Sepp server at {addr}: {reason}")]
     Connect { addr: String, reason: String },
+    /// The configured API key could not be encoded as an HTTP header value.
     #[error("the API key is not a valid HTTP header value")]
     InvalidApiKey,
+    /// A transient transport-level failure (connection dropped, deadline
+    /// exceeded, request aborted/cancelled). Generally safe to retry.
     #[error("transport failure: {0}")]
     Transport(String),
+    /// The server rejected the credentials (missing/invalid API key, or
+    /// permission denied).
     #[error("authentication failed: {0}")]
     Unauthenticated(String),
+    /// The server is shedding load (`ResourceExhausted`); back off and retry.
     #[error("server is overloaded: {0}")]
     Overloaded(String),
+    /// The server rejected the request as malformed (`InvalidArgument`).
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// The server hit an internal error (`Internal` / `DataLoss` / `Unknown`).
     #[error("server internal error: {0}")]
     ServerInternal(String),
+    /// The server returned a status code this client does not map to a more
+    /// specific variant.
     #[error("server returned unexpected status {code:?}: {message}")]
     UnexpectedStatus { code: tonic::Code, message: String },
+    /// An enqueue was attempted with no jobs.
     #[error("empty batch")]
     EmptyBatch,
+    /// The server returned a different number of results than jobs sent — a
+    /// protocol violation.
     #[error("server returned {got} results for a batch of {expected} jobs")]
     BatchResultCountMismatch { expected: usize, got: usize },
+    /// A response was missing a field the protocol requires.
     #[error("malformed response: {0}")]
     MalformedResponse(&'static str),
+    /// A job in a response could not be decoded; see [`JobConversionError`].
     #[error("server returned a malformed job: {0}")]
     MalformedJob(#[from] JobConversionError),
+    /// A server-info response could not be decoded; see [`ServerInfoError`].
     #[error("server returned malformed server info: {0}")]
     MalformedServerInfo(#[from] ServerInfoError),
 }
@@ -85,11 +125,18 @@ impl From<tonic::Status> for ClientError {
     }
 }
 
+/// The error type of [`SeppClient::enqueue`] (the single-job convenience
+/// wrapper).
+///
+/// Separates a deterministic per-job [`JobRejection`] from a
+/// connection/protocol-level [`ClientError`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum EnqueueError {
+    /// The server accepted the request but rejected this specific job.
     #[error("server rejected the job: {0}")]
     Rejected(JobRejection),
+    /// The call failed before a per-job verdict was reached.
     #[error(transparent)]
     Client(#[from] ClientError),
 }
@@ -100,13 +147,25 @@ impl From<tonic::Status> for EnqueueError {
     }
 }
 
+/// The error type of the lease operations [`ack`](SeppClient::ack),
+/// [`nack`](SeppClient::nack), and [`extend`](SeppClient::extend).
+///
+/// [`JobNotFound`](Self::JobNotFound) and [`AttemptMismatch`](Self::AttemptMismatch)
+/// both mean the worker no longer holds the lease — typically because it was
+/// allowed to expire and the job was redelivered. In that case any work the
+/// handler did may be processed again by another worker.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LeaseError {
+    /// No in-flight job has this id: it was already acked, the lease expired,
+    /// or it never existed.
     #[error("no in-flight job with this id (already acked, expired, or never existed)")]
     JobNotFound,
+    /// The attempt number no longer matches the server's: the lease was
+    /// reassigned to another delivery.
     #[error("attempt mismatch: the lease was reassigned")]
     AttemptMismatch,
+    /// A transport- or protocol-level failure.
     #[error(transparent)]
     Client(#[from] ClientError),
 }
@@ -122,11 +181,15 @@ impl From<tonic::Status> for LeaseError {
     }
 }
 
+/// The error type of [`SeppClient::reserve`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReserveError {
+    /// The server is in strict mode and one or more requested queues are not
+    /// declared; the message lists them.
     #[error("requested queues are not declared on the server: {0}")]
     UnknownQueues(String),
+    /// A transport- or protocol-level failure.
     #[error(transparent)]
     Client(#[from] ClientError),
 }
@@ -141,13 +204,38 @@ impl From<tonic::Status> for ReserveError {
     }
 }
 
+/// How the server should handle a [`nack`](SeppClient::nack)ed job's next
+/// delivery.
+///
+/// This is *job-level* retry (the handler failed), distinct from the
+/// connection-level [`RetryPolicy`] (the RPC failed).
 #[derive(Debug, Clone)]
 pub enum RetryDirective {
+    /// Apply the queue's configured retry policy (backoff, max attempts).
     Default,
+    /// Retry, but not before the given delay has elapsed.
     After(Duration),
+    /// Do not retry; send the job straight to the dead-letter queue.
     DeadLetter,
 }
 
+/// Backoff policy for retrying *transient* RPC failures (those mapped to
+/// [`ClientError::Transport`] / [`Overloaded`](ClientError::Overloaded)).
+///
+/// Applies to enqueue, ack, nack, extend, and get-server-info — but not to
+/// [`reserve`](SeppClient::reserve), which is a long poll. The default policy
+/// performs **no** retries (`max_attempts == 1`); opt in by building one up and
+/// passing it to [`SeppClientBuilder::retry_policy`].
+///
+/// ```
+/// use std::time::Duration;
+/// use sepp_rs::client::RetryPolicy;
+///
+/// let policy = RetryPolicy::default()
+///     .with_max_attempts(5)
+///     .with_initial_backoff(Duration::from_millis(50))
+///     .with_max_backoff(Duration::from_secs(5));
+/// ```
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     max_attempts: u32,
@@ -158,31 +246,42 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Sets the total number of attempts (including the first). Values below 1
+    /// are clamped to 1, so `1` means "no retries".
     pub fn with_max_attempts(mut self, n: u32) -> Self {
         self.max_attempts = n.max(1);
         self
     }
 
+    /// Sets the backoff before the first retry. Each subsequent retry multiplies
+    /// this by [`with_multiplier`](Self::with_multiplier), capped at
+    /// [`with_max_backoff`](Self::with_max_backoff).
     pub fn with_initial_backoff(mut self, d: Duration) -> Self {
         self.initial_backoff = d;
         self
     }
 
+    /// Caps the backoff between retries.
     pub fn with_max_backoff(mut self, d: Duration) -> Self {
         self.max_backoff = d;
         self
     }
 
+    /// Sets the exponential growth factor for the backoff. Values below 1.0 are
+    /// clamped to 1.0 (constant backoff).
     pub fn with_multiplier(mut self, m: f64) -> Self {
         self.multiplier = m.max(1.0);
         self
     }
 
+    /// Disables jitter. By default each delay is randomized within
+    /// `[0.5, 1.0)` of its computed value to avoid thundering herds.
     pub fn without_jitter(mut self) -> Self {
         self.jitter = false;
         self
     }
 
+    /// Returns the configured number of attempts.
     pub fn max_attempts(&self) -> u32 {
         self.max_attempts
     }
@@ -201,15 +300,25 @@ impl Default for RetryPolicy {
 }
 
 impl SeppClient {
-    /// Connect to a Sepp server over plaintext with no authentication.
+    /// Connects to a Sepp server over plaintext with no authentication.
+    ///
+    /// `addr` is a URI such as `http://127.0.0.1:50051`. For API-key auth, TLS,
+    /// or a custom [`RetryPolicy`], use [`builder`](Self::builder) instead.
     pub async fn connect(addr: impl Into<String>) -> Result<Self, ClientError> {
         Self::builder(addr).connect().await
     }
 
+    /// Starts building a client for `addr`, allowing authentication, TLS, and
+    /// retry configuration before [`connect`](SeppClientBuilder::connect).
     pub fn builder(addr: impl Into<String>) -> SeppClientBuilder {
         SeppClientBuilder::new(addr)
     }
 
+    /// Wraps an already-established tonic [`Channel`], with no authentication
+    /// and the default [`RetryPolicy`].
+    ///
+    /// Use this to share a channel or apply custom tonic transport
+    /// configuration the builder does not expose.
     pub fn from_channel(channel: Channel) -> Self {
         Self {
             inner: QueueServiceClient::with_interceptor(channel, ApiKeyInterceptor::disabled()),
@@ -222,6 +331,16 @@ impl SeppClient {
         skip_all,
         fields(otel.kind = "client", otel.status_code = tracing::field::Empty, jobs)
     )]
+    /// Enqueues a batch of jobs on a best-effort basis.
+    ///
+    /// Each job is accepted or rejected independently: the returned vector has
+    /// one entry per submitted job, in the same order, where the inner `Result`
+    /// is `Ok` for an accepted job or `Err` for a per-job [`JobRejection`]. The
+    /// outer `Err` is reserved for whole-call failures (empty batch, transport
+    /// error, protocol violation). Transient failures are retried per the
+    /// client's [`RetryPolicy`].
+    ///
+    /// For all-or-nothing semantics, use [`enqueue_atomic`](Self::enqueue_atomic).
     pub async fn enqueue_batch(
         &self,
         jobs: impl IntoIterator<Item = EnqueueRequest>,
@@ -271,6 +390,11 @@ impl SeppClient {
         Ok(results)
     }
 
+    /// Enqueues a single job.
+    ///
+    /// A convenience wrapper over [`enqueue_batch`](Self::enqueue_batch) that
+    /// flattens the result: a per-job rejection becomes
+    /// [`EnqueueError::Rejected`].
     pub async fn enqueue(&self, job: EnqueueRequest) -> Result<EnqueueAck, EnqueueError> {
         let mut results = self.enqueue_batch(std::iter::once(job)).await?.into_iter();
 
@@ -288,6 +412,13 @@ impl SeppClient {
         skip_all,
         fields(otel.kind = "client", otel.status_code = tracing::field::Empty, jobs)
     )]
+    /// Enqueues a batch of jobs atomically: either all are accepted or none are.
+    ///
+    /// On success, returns one [`EnqueueAck`] per job, in order. If any job
+    /// fails validation, nothing is enqueued and every failure is returned
+    /// together as [`AtomicEnqueueError::Validation`](crate::AtomicEnqueueError::Validation).
+    /// Use this when the jobs are coordinated steps and a partial enqueue would
+    /// leave the system inconsistent.
     pub async fn enqueue_atomic(
         &self,
         jobs: impl IntoIterator<Item = EnqueueRequest>,
@@ -343,6 +474,19 @@ impl SeppClient {
             worker_id = opts.worker_id.as_deref().unwrap_or("<none>"),
         )
     )]
+    /// Long-polls for jobs to process.
+    ///
+    /// Blocks up to the options' [`wait_timeout`](ReserveOptions::wait_timeout)
+    /// for at least one job. Returns `Ok(Some(jobs))` with one or more leased
+    /// [`Job`]s, or `Ok(None)` if the wait elapsed with nothing available (poll
+    /// again). Each returned job must be [`ack`](Self::ack)ed,
+    /// [`nack`](Self::nack)ed, or [`extend`](Self::extend)ed before its lease
+    /// expires.
+    ///
+    /// Unlike the other RPCs, reserve is **not** retried by the
+    /// [`RetryPolicy`]: as a long poll, an empty return is the normal idle
+    /// outcome and the caller loops anyway. A malformed job in the response is
+    /// logged and skipped rather than failing the whole batch.
     pub async fn reserve(&self, opts: &ReserveOptions) -> Result<Option<Vec<Job>>, ReserveError> {
         let msg = pb::ReserveRequest::from(opts);
         let mut request = Request::new(msg);
@@ -386,6 +530,12 @@ impl SeppClient {
             worker_id = ctx.lease.worker_id.as_deref().unwrap_or("<none>"),
         )
     )]
+    /// Acknowledges that a job completed successfully, removing it from the
+    /// queue.
+    ///
+    /// The `attempt` carried by `ctx` guards against acking a job whose lease
+    /// was already reassigned — that surfaces as
+    /// [`LeaseError::AttemptMismatch`] or [`LeaseError::JobNotFound`].
     pub async fn ack(&self, ctx: &JobCtx) -> Result<(), LeaseError> {
         let body = pb::AckRequest {
             job_id: ctx.id.clone(),
@@ -413,6 +563,12 @@ impl SeppClient {
             worker_id = ctx.lease.worker_id.as_deref().unwrap_or("<none>"),
         )
     )]
+    /// Negatively acknowledges a job, signalling that processing failed.
+    ///
+    /// `retry` selects what the server does next (see [`RetryDirective`]) and
+    /// `reason` is recorded for debugging and metrics. Returns `true` if this
+    /// nack moved the job to the dead-letter queue (because `DeadLetter` was
+    /// requested or `max_attempts` was reached), `false` if it will be retried.
     pub async fn nack(
         &self,
         ctx: &JobCtx,
@@ -444,6 +600,13 @@ impl SeppClient {
         Ok(response.dead_lettered)
     }
 
+    /// Extends a job's lease by `extension`, measured from now, returning the
+    /// new expiry.
+    ///
+    /// Call this when a handler needs longer than the original lease. Equivalent
+    /// to [`JobCtx::extend`]; a [`Worker`](crate::worker::Worker) with
+    /// [`with_auto_extend`](crate::worker::Worker::with_auto_extend) does it
+    /// automatically.
     pub async fn extend(
         &self,
         ctx: &JobCtx,
@@ -500,6 +663,10 @@ impl SeppClient {
         skip_all,
         fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
     )]
+    /// Fetches the server's [`ServerInfo`]: version, capabilities, and limits.
+    ///
+    /// Useful once at startup so a producer can validate jobs locally against
+    /// the advertised limits and avoid round-trips that would only be rejected.
     pub async fn get_server_info(&self) -> Result<ServerInfo, ClientError> {
         let response = with_retry(&self.retry_policy, "get_server_info", || {
             let request = Request::new(pb::GetServerInfoRequest {});
@@ -565,6 +732,25 @@ impl std::fmt::Debug for Lease {
     }
 }
 
+/// Configures and connects a [`SeppClient`].
+///
+/// Created by [`SeppClient::builder`]. Set an [`api_key`](Self::api_key), a
+/// [`retry_policy`](Self::retry_policy), and (with the `tls` feature) TLS
+/// options, then call [`connect`](Self::connect).
+///
+/// ```no_run
+/// use sepp_rs::client::{RetryPolicy, SeppClient};
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let client = SeppClient::builder("http://127.0.0.1:50051")
+///     .api_key("secret")
+///     .retry_policy(RetryPolicy::default().with_max_attempts(3))
+///     .connect()
+///     .await?;
+/// # let _ = client;
+/// # Ok(())
+/// # }
+/// ```
 pub struct SeppClientBuilder {
     addr: String,
     api_key: Option<String>,
@@ -584,22 +770,35 @@ impl SeppClientBuilder {
         }
     }
 
+    /// Sends an `Authorization: Bearer <key>` header on every request.
+    ///
+    /// Without TLS the key travels in plaintext, so [`connect`](Self::connect)
+    /// logs a warning if you set a key but no TLS.
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
     }
 
+    /// Sets the [`RetryPolicy`] for transient RPC failures. The default policy
+    /// does not retry.
     pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
     }
 
+    /// Enables TLS using the platform's native root certificates.
+    ///
+    /// *Requires the `tls` feature.*
     #[cfg(feature = "tls")]
     pub fn tls(mut self) -> Self {
         self.tls = Some(self.tls.unwrap_or_default().with_native_roots());
         self
     }
 
+    /// Enables TLS and trusts the given PEM-encoded CA certificate, e.g. for a
+    /// private/self-signed server.
+    ///
+    /// *Requires the `tls` feature.*
     #[cfg(feature = "tls")]
     pub fn tls_ca_certificate(mut self, pem: impl AsRef<[u8]>) -> Self {
         let config = self.tls.unwrap_or_default();
@@ -607,6 +806,10 @@ impl SeppClientBuilder {
         self
     }
 
+    /// Overrides the domain name verified against the server certificate, for
+    /// when the connection address differs from the certificate's name.
+    ///
+    /// *Requires the `tls` feature.*
     #[cfg(feature = "tls")]
     pub fn tls_domain(mut self, domain: impl Into<String>) -> Self {
         let config = self.tls.unwrap_or_default();
@@ -614,12 +817,18 @@ impl SeppClientBuilder {
         self
     }
 
+    /// Sets a fully custom tonic [`ClientTlsConfig`], replacing any TLS options
+    /// set by the other `tls_*` methods.
+    ///
+    /// *Requires the `tls` feature.*
     #[cfg(feature = "tls")]
     pub fn tls_config(mut self, config: ClientTlsConfig) -> Self {
         self.tls = Some(config);
         self
     }
 
+    /// Connects to the server with the configured options, yielding a ready
+    /// [`SeppClient`].
     pub async fn connect(self) -> Result<SeppClient, ClientError> {
         let addr = self.addr;
         let interceptor =
@@ -676,6 +885,10 @@ impl SeppClientBuilder {
     }
 }
 
+/// A tonic interceptor that attaches the configured API key as an
+/// `Authorization: Bearer <key>` header on each request.
+///
+/// Installed by [`SeppClientBuilder::api_key`]; not constructed directly.
 #[derive(Clone)]
 pub struct ApiKeyInterceptor {
     // Pre-rendered `Bearer <key>` header value; None disables the interceptor.
