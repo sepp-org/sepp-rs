@@ -830,6 +830,16 @@ pub struct ServerInfo {
     pub max_custom_entries: u32,
     pub max_custom_total_bytes: u64,
     pub max_custom_key_bytes: u32,
+    pub max_queue_name_bytes: u32,
+    pub max_job_type_bytes: u32,
+    pub max_idempotency_key_bytes: u32,
+    pub max_schedule_horizon_ms: u64,
+    pub max_enqueue_batch: u32,
+    pub max_reserve_batch: u32,
+    pub max_reserve_queues: u32,
+    pub max_wait_timeout_ms: u64,
+    pub max_lease_duration_ms: u64,
+    pub strict_queues: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -860,6 +870,16 @@ impl TryFrom<crate::pb::sepp::v1::GetServerInfoResponse> for ServerInfo {
             max_custom_entries: r.max_custom_entries,
             max_custom_total_bytes: r.max_custom_total_bytes,
             max_custom_key_bytes: r.max_custom_key_bytes,
+            max_queue_name_bytes: r.max_queue_name_bytes,
+            max_job_type_bytes: r.max_job_type_bytes,
+            max_idempotency_key_bytes: r.max_idempotency_key_bytes,
+            max_schedule_horizon_ms: r.max_schedule_horizon_ms,
+            max_enqueue_batch: r.max_enqueue_batch,
+            max_reserve_batch: r.max_reserve_batch,
+            max_reserve_queues: r.max_reserve_queues,
+            max_wait_timeout_ms: r.max_wait_timeout_ms,
+            max_lease_duration_ms: r.max_lease_duration_ms,
+            strict_queues: r.strict_queues,
         })
     }
 }
@@ -1702,6 +1722,16 @@ mod tests {
             max_custom_entries: 10,
             max_custom_total_bytes: 2048,
             max_custom_key_bytes: 64,
+            max_queue_name_bytes: 512,
+            max_job_type_bytes: 256,
+            max_idempotency_key_bytes: 128,
+            max_schedule_horizon_ms: 86_400_000,
+            max_enqueue_batch: 100,
+            max_reserve_batch: 50,
+            max_reserve_queues: 8,
+            max_wait_timeout_ms: 30_000,
+            max_lease_duration_ms: 60_000,
+            strict_queues: true,
         }
     }
 
@@ -1736,6 +1766,16 @@ mod tests {
         assert_eq!(info.max_custom_entries, 10);
         assert_eq!(info.max_custom_total_bytes, 2048);
         assert_eq!(info.max_custom_key_bytes, 64);
+        assert_eq!(info.max_queue_name_bytes, 512);
+        assert_eq!(info.max_job_type_bytes, 256);
+        assert_eq!(info.max_idempotency_key_bytes, 128);
+        assert_eq!(info.max_schedule_horizon_ms, 86_400_000);
+        assert_eq!(info.max_enqueue_batch, 100);
+        assert_eq!(info.max_reserve_batch, 50);
+        assert_eq!(info.max_reserve_queues, 8);
+        assert_eq!(info.max_wait_timeout_ms, 30_000);
+        assert_eq!(info.max_lease_duration_ms, 60_000);
+        assert!(info.strict_queues);
         assert_eq!(
             info.server_time,
             SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)

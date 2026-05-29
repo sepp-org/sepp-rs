@@ -4,9 +4,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Proto files are vendored into `proto/` (committed to the repo, shipped in
-    // the published crate). To refresh them after an upstream change, run:
+    // the published crate). The version below is the one currently vendored; to
+    // refresh, bump it to a newer published label/commit and re-run:
     //
-    //     buf export buf.build/sepp-org/sepp-proto -o proto
+    //     buf export buf.build/sepp-org/sepp-proto:v1.0.0 -o proto
     //
     // The build itself never invokes `buf` or touches the network, so it works
     // on docs.rs, in offline CI, and for anyone who `cargo add`s this crate.

@@ -123,7 +123,7 @@ message Job {
 
   // Wall-clock time when the lease on this job expires. Milliseconds since Unix epoch UTC.
   // If the worker has not acked/nacked/extended by this time, the job becomes available for redelivery.
-  int64 lease_expires_at = 9 [(buf.validate.field).int64.gt = 1];
+  int64 lease_expires_at = 9 [(buf.validate.field).int64.gt = 0];
 
   // Custom key-value pairs.
   map<string, PrimitiveValue> custom = 10 [(buf.validate.field).map = {
@@ -352,7 +352,7 @@ message JobValidationError {
 // Reserve (unary)
 // ============================================================================
 
-// Worker requests a single job in a long polling manner.
+// Worker requests one or more jobs in a long-polling manner.
 message ReserveRequest {
   // Queues to pull from. Worker is willing to process jobs from any of these.
   // Queue at index 0 is polled first, then index 1, etc.
@@ -364,22 +364,28 @@ message ReserveRequest {
   }];
 
   // How long the worker is willing to wait for a job, in milliseconds.
-  // If no job is available within this window, the response has no job.
+  // If no job is available within this window, the response has no jobs.
+  // The server clamps this to its configured max (max_wait_timeout_ms,
+  // advertised in GetServerInfo); a larger value is not an error.
   uint64 wait_timeout_ms = 2;
 
-  // Lease duration the worker wants. Server may clamp to its configured max.
-  // The worker must ack, nack, or extend before this time elapses, or the
-  // job will be redelivered.
+  // Lease duration the worker wants. Server may clamp to its configured max
+  // (max_lease_duration_ms, advertised in GetServerInfo). The worker must ack,
+  // nack, or extend before this time elapses, or the job will be redelivered.
   uint64 lease_duration_ms = 3 [(buf.validate.field).uint64.gte = 1];
 
   // A stable worker identifier, useful for observability and
   // sticky-routing future features.
   optional string worker_id = 4 [(buf.validate.field).string.min_len = 1];
 
+  // Maximum number of jobs to return in one response. Defaults to 1 if unset.
+  // The server clamps this to its configured max (max_reserve_batch, advertised
+  // in GetServerInfo); a larger value is not an error.
   optional uint32 max_jobs = 5 [(buf.validate.field).uint32.gte = 1];
 }
 
-// Zero or one job. Empty when the wait timeout fires with no job available.
+// Zero or more jobs, up to the effective max_jobs. Empty when the wait timeout
+// fires with no job available.
 message ReserveResponse {
   repeated Job jobs = 1;
 }
@@ -490,4 +496,43 @@ message GetServerInfoResponse {
   uint32 max_custom_entries = 7;
   uint64 max_custom_total_bytes = 8;
   uint32 max_custom_key_bytes = 9;
+
+  // The limits below let clients validate locally before sending and avoid the
+  // corresponding deterministic JobRejection. They reflect the server's default
+  // (unscoped) limits; a specific queue MAY have stricter or laxer limits configured.
+
+  // Max bytes in a queue name (-> QueueNameTooLong).
+  uint32 max_queue_name_bytes = 10;
+
+  // Max bytes in a job_type (-> JobTypeNameTooLong).
+  uint32 max_job_type_bytes = 11;
+
+  // Max bytes in an idempotency_key (-> IdempotencyKeyTooLong).
+  uint32 max_idempotency_key_bytes = 12;
+
+  // How far ahead scheduled_at may be set, in milliseconds (-> ScheduledTooFar).
+  uint64 max_schedule_horizon_ms = 13;
+
+  // Max jobs accepted in a single EnqueueBatch/EnqueueAtomic request. Batches
+  // larger than this fail the whole request with INVALID_ARGUMENT.
+  uint32 max_enqueue_batch = 14;
+
+  // Reserve tuning hints. The server clamps Reserve requests to these maxima
+  // rather than rejecting them; clients can use these to size requests well.
+
+  // Max jobs returned by a single Reserve (clamps ReserveRequest.max_jobs).
+  uint32 max_reserve_batch = 15;
+
+  // Max queues a single Reserve may list (exceeding this is INVALID_ARGUMENT).
+  uint32 max_reserve_queues = 16;
+
+  // Max long-poll wait, in milliseconds (clamps ReserveRequest.wait_timeout_ms).
+  uint64 max_wait_timeout_ms = 17;
+
+  // Max lease duration, in milliseconds (clamps ReserveRequest.lease_duration_ms).
+  uint64 max_lease_duration_ms = 18;
+
+  // If true, the server is in strict mode: enqueueing to an undeclared queue is
+  // rejected with UnknownQueue. If false, queues are created on demand.
+  bool strict_queues = 19;
 }
