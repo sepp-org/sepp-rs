@@ -59,6 +59,24 @@ service QueueService {
   // Extend the lease on an in-flight job. Same status codes as Ack.
   rpc Extend(ExtendRequest) returns (ExtendResponse);
 
+  // Drain dead-lettered jobs for inspection and manual replay.
+  //
+  // Returns up to `max` DeadLetterRecords (oldest-first, optionally filtered to
+  // a single queue) and REMOVES them from the server in the same transaction
+  // before responding. This is destructive and privileged: there is no
+  // redelivery token (unlike Reserve/Ack), so a dropped response permanently
+  // removes the jobs.
+  //
+  // An empty list means nothing matched, which is indistinguishable from
+  // dead-letter retention being disabled — check dead_letter_retention_enabled
+  // in GetServerInfo.
+  //
+  // gRPC status codes:
+  //   INVALID_ARGUMENT  - request shape is malformed
+  //   UNAUTHENTICATED   - missing or invalid API key
+  //   INTERNAL          - server-side storage failure
+  rpc DrainDeadLetters(DrainDeadLettersRequest) returns (DrainDeadLettersResponse);
+
   // Get server info and capabilities. INTERNAL on storage failure; otherwise infallible.
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 }
@@ -94,7 +112,8 @@ message Payload {
   string encoding = 2 [(buf.validate.field).string.min_len = 1];
 }
 
-// A job ready for a worker to process. Returned by Reserve and ReserveStream.
+// A job ready for a worker to process. Returned by Reserve and embedded in the
+// DeadLetterRecords returned by DrainDeadLetters.
 message Job {
   // Server-assigned job ID (UUID).
   string id = 1 [(buf.validate.field).string.uuid = true];
@@ -134,6 +153,12 @@ message Job {
 
   // Schedule for future execution. If unset, the job is available immediately.
   optional int64 scheduled_at = 11 [(buf.validate.field).int64.gt = 0];
+
+  // The queue this job belongs to. Populated on jobs returned by Reserve and on
+  // the job embedded in a DeadLetterRecord, so a worker reserving from several
+  // queues can tell which one each job came from. (Empty in the server's own
+  // stored representation, where the queue is keyed separately.)
+  string queue = 12 [(buf.validate.field).string.min_len = 1];
 }
 
 // Reason a single job in an enqueue batch was rejected. Every variant
@@ -467,6 +492,70 @@ message ExtendResponse {
 }
 
 // ============================================================================
+// Dead-letter
+// ============================================================================
+
+// Why a job was moved to dead-letter. Mirrors the three terminal paths on the
+// server: a worker explicitly rejected it, it ran out of attempts, or its lease
+// expired with no attempts left.
+enum DeadLetterCause {
+  DEAD_LETTER_CAUSE_UNSPECIFIED = 0;
+
+  // The job exhausted its max_attempts across nacks and redeliveries.
+  DEAD_LETTER_CAUSE_ATTEMPTS_EXHAUSTED = 1;
+
+  // A worker nacked with the dead_letter strategy, skipping remaining attempts.
+  DEAD_LETTER_CAUSE_REJECTED = 2;
+
+  // The lease expired while the job was on its final attempt, so it could not
+  // be redelivered.
+  DEAD_LETTER_CAUSE_LEASE_EXPIRED = 3;
+}
+
+// A terminal record of a job that was dead-lettered. Retained only when the
+// server has dead-letter retention enabled (see
+// GetServerInfoResponse.dead_letter_retention_enabled), and returned by
+// DrainDeadLetters for inspection and manual replay.
+message DeadLetterRecord {
+  // The dead-lettered job, as a snapshot at failure time: the stored job
+  // augmented with its queue and payload. Transient fields such as
+  // lease_expires_at may be 0 or stale, so do not validate it as a live Job — to
+  // replay, copy its fields into an EnqueueRequest.
+  Job job = 1;
+
+  // Why the job was dead-lettered.
+  DeadLetterCause cause = 2;
+
+  // Wall-clock time the job was dead-lettered. Milliseconds since Unix epoch UTC.
+  int64 failed_at = 3 [(buf.validate.field).int64.gt = 0];
+
+  // The attempt number the job died on (1-based).
+  uint32 final_attempt = 4 [(buf.validate.field).uint32.gte = 1];
+
+  // The reason from the last Nack, when the job died on a nack path. Absent when
+  // the job died because its lease expired (no worker reported a reason).
+  optional string last_reason = 5;
+}
+
+// Request to drain dead-lettered records. See the DrainDeadLetters rpc.
+message DrainDeadLettersRequest {
+  // Restrict the drain to a single queue. If unset, drains across all queues,
+  // oldest-first.
+  optional string queue = 1 [(buf.validate.field).string.min_len = 1];
+
+  // Maximum number of records to return in one response. Defaults to 1 if unset.
+  // The server clamps this to its configured max (max_reserve_batch, advertised
+  // in GetServerInfo); a larger value is not an error.
+  optional uint32 max = 2 [(buf.validate.field).uint32.gte = 1];
+}
+
+// Dead-letter records removed from the server, oldest-first. Empty when nothing
+// matched (or dead-letter retention is disabled).
+message DrainDeadLettersResponse {
+  repeated DeadLetterRecord records = 1;
+}
+
+// ============================================================================
 // Server info
 // ============================================================================
 
@@ -535,4 +624,9 @@ message GetServerInfoResponse {
   // If true, the server is in strict mode: enqueueing to an undeclared queue is
   // rejected with UnknownQueue. If false, queues are created on demand.
   bool strict_queues = 19;
+
+  // If true, the server retains dead-lettered jobs (dead_letter_retention_ms > 0)
+  // and DrainDeadLetters can return them. If false, dead jobs are deleted on
+  // dead-letter and DrainDeadLetters always returns an empty list.
+  bool dead_letter_retention_enabled = 20;
 }

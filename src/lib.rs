@@ -844,6 +844,9 @@ impl From<tonic::Status> for AtomicEnqueueError {
 pub struct JobCtx {
     /// Server-assigned job id (a UUID).
     pub id: String,
+    /// The queue this job was reserved from. Useful when a worker reserves from
+    /// several queues and needs to tell which one each job came from.
+    pub queue: String,
     /// The job type, used to route to a handler.
     pub job_type: String,
     /// The job's effective priority.
@@ -1030,6 +1033,7 @@ pub(crate) fn job_from_pb(
         payload: j.payload.map(Into::into),
         ctx: JobCtx {
             id: j.id,
+            queue: j.queue,
             job_type: j.job_type,
             priority,
             attempt: j.attempt,
@@ -1210,6 +1214,10 @@ pub struct ServerInfo {
     /// If `true`, enqueueing to an undeclared queue is rejected with
     /// [`JobRejection::UnknownQueue`]; if `false`, queues are created on demand.
     pub strict_queues: bool,
+    /// If `true`, the server retains dead-lettered jobs and
+    /// [`drain_dead_letters`](client::SeppClient::drain_dead_letters) can return
+    /// them; if `false`, dead jobs are deleted and drain always returns empty.
+    pub dead_letter_retention_enabled: bool,
 }
 
 /// Returned when a [`get_server_info`](client::SeppClient::get_server_info)
@@ -1254,8 +1262,180 @@ impl TryFrom<crate::pb::sepp::v1::GetServerInfoResponse> for ServerInfo {
             max_wait_timeout_ms: r.max_wait_timeout_ms,
             max_lease_duration_ms: r.max_lease_duration_ms,
             strict_queues: r.strict_queues,
+            dead_letter_retention_enabled: r.dead_letter_retention_enabled,
         })
     }
+}
+
+/// Why a job was moved to the server's dead-letter store. Mirrors the three
+/// terminal paths a job can take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeadLetterCause {
+    /// The cause was unset — an unknown or future variant.
+    Unspecified,
+    /// The job exhausted its max attempts across nacks and redeliveries.
+    AttemptsExhausted,
+    /// A worker nacked with
+    /// [`RetryDirective::DeadLetter`](client::RetryDirective::DeadLetter),
+    /// skipping its remaining attempts.
+    Rejected,
+    /// The lease expired while the job was on its final attempt.
+    LeaseExpired,
+}
+
+impl From<crate::pb::sepp::v1::DeadLetterCause> for DeadLetterCause {
+    fn from(c: crate::pb::sepp::v1::DeadLetterCause) -> Self {
+        use crate::pb::sepp::v1::DeadLetterCause as Pb;
+        match c {
+            Pb::Unspecified => Self::Unspecified,
+            Pb::AttemptsExhausted => Self::AttemptsExhausted,
+            Pb::Rejected => Self::Rejected,
+            Pb::LeaseExpired => Self::LeaseExpired,
+        }
+    }
+}
+
+/// A dead-lettered job retained by the server, returned by
+/// [`drain_dead_letters`](client::SeppClient::drain_dead_letters).
+///
+/// It is a snapshot for inspection and manual replay: read [`cause`](Self::cause),
+/// [`last_reason`](Self::last_reason), and [`final_attempt`](Self::final_attempt)
+/// to see what went wrong, then call
+/// [`to_enqueue_request`](Self::to_enqueue_request) to re-submit it.
+#[derive(Debug, Clone)]
+pub struct DeadLetterRecord {
+    /// The queue the job belonged to.
+    pub queue: String,
+    /// The dead-lettered job's server-assigned id.
+    pub job_id: String,
+    /// The producer's job-type tag.
+    pub job_type: String,
+    /// The job's payload, if any.
+    pub payload: Option<Payload>,
+    /// The job's effective priority.
+    pub priority: Priority,
+    /// Custom metadata the producer attached.
+    pub custom: HashMap<String, Primitive>,
+    /// The producer's trace context, if any and well-formed.
+    pub trace_context: Option<TraceContext>,
+    /// When the producer originally enqueued the job.
+    pub enqueued_at: SystemTime,
+    /// Why the job was dead-lettered.
+    pub cause: DeadLetterCause,
+    /// When the job was dead-lettered.
+    pub failed_at: SystemTime,
+    /// The attempt the job died on (1-based).
+    pub final_attempt: u32,
+    /// The reason from the last nack, when the job died on a nack path; `None`
+    /// for a lease-expiry death.
+    pub last_reason: Option<String>,
+}
+
+impl DeadLetterRecord {
+    /// Builds an [`EnqueueRequest`] that replays this job into its original
+    /// queue, preserving its payload, priority, custom metadata, and trace
+    /// context. The replay is a fresh job — the server assigns a new id and
+    /// resets the attempt counter.
+    ///
+    /// Equivalent to `EnqueueRequest::from(&record)`; both leave the record
+    /// intact. To consume the record without cloning, use
+    /// `EnqueueRequest::from(record)` (or `record.into()`).
+    pub fn to_enqueue_request(&self) -> EnqueueRequest {
+        self.into()
+    }
+}
+
+impl From<DeadLetterRecord> for EnqueueRequest {
+    /// Replays a dead-lettered job into its original queue, consuming the record.
+    fn from(r: DeadLetterRecord) -> Self {
+        EnqueueRequest {
+            queue: r.queue,
+            job_type: r.job_type,
+            payload: r.payload,
+            idempotency_key: None,
+            priority: Some(r.priority),
+            max_attempts: None,
+            custom: r.custom,
+            trace_context: r.trace_context,
+            scheduled_at: None,
+        }
+    }
+}
+
+impl From<&DeadLetterRecord> for EnqueueRequest {
+    /// Replays a dead-lettered job into its original queue, leaving the record
+    /// intact.
+    fn from(r: &DeadLetterRecord) -> Self {
+        EnqueueRequest {
+            queue: r.queue.clone(),
+            job_type: r.job_type.clone(),
+            payload: r.payload.clone(),
+            idempotency_key: None,
+            priority: Some(r.priority),
+            max_attempts: None,
+            custom: r.custom.clone(),
+            trace_context: r.trace_context.clone(),
+            scheduled_at: None,
+        }
+    }
+}
+
+pub(crate) fn dead_letter_record_from_pb(
+    r: crate::pb::sepp::v1::DeadLetterRecord,
+) -> Result<DeadLetterRecord, JobConversionError> {
+    use JobConversionError as E;
+    let j = r.job.ok_or(E::MissingField("job"))?;
+
+    if j.id.is_empty() {
+        return Err(E::MissingField("id"));
+    }
+    if j.job_type.is_empty() {
+        return Err(E::MissingField("job_type"));
+    }
+
+    let priority = u8::try_from(j.priority)
+        .ok()
+        .and_then(|p| Priority::new(p).ok())
+        .ok_or(E::PriorityOutOfRange(j.priority))?;
+
+    let enqueued_at = millis_to_system_time(j.enqueued_at).ok_or(E::InvalidTimestamp {
+        field: "enqueued_at",
+        value: j.enqueued_at,
+    })?;
+    let failed_at = millis_to_system_time(r.failed_at).ok_or(E::InvalidTimestamp {
+        field: "failed_at",
+        value: r.failed_at,
+    })?;
+
+    let mut custom = HashMap::with_capacity(j.custom.len());
+    for (k, v) in j.custom {
+        let value = primitive_from_pb(v).ok_or_else(|| E::EmptyCustomValue(k.clone()))?;
+        custom.insert(k, value);
+    }
+
+    let trace_context = j
+        .trace_context
+        .and_then(|tc| TraceContext::try_from(tc).ok());
+
+    let cause = crate::pb::sepp::v1::DeadLetterCause::try_from(r.cause)
+        .unwrap_or(crate::pb::sepp::v1::DeadLetterCause::Unspecified)
+        .into();
+
+    Ok(DeadLetterRecord {
+        queue: j.queue,
+        job_id: j.id,
+        job_type: j.job_type,
+        payload: j.payload.map(Into::into),
+        priority,
+        custom,
+        trace_context,
+        enqueued_at,
+        cause,
+        failed_at,
+        final_attempt: r.final_attempt,
+        last_reason: r.last_reason,
+    })
 }
 
 #[cfg(test)]
@@ -1844,6 +2024,7 @@ mod tests {
             lease_expires_at: 1_700_000_060_000,
             custom: HashMap::new(),
             scheduled_at: None,
+            queue: "emails".into(),
         }
     }
 
@@ -2106,6 +2287,7 @@ mod tests {
             max_wait_timeout_ms: 30_000,
             max_lease_duration_ms: 60_000,
             strict_queues: true,
+            dead_letter_retention_enabled: false,
         }
     }
 
@@ -2150,9 +2332,116 @@ mod tests {
         assert_eq!(info.max_wait_timeout_ms, 30_000);
         assert_eq!(info.max_lease_duration_ms, 60_000);
         assert!(info.strict_queues);
+        assert!(!info.dead_letter_retention_enabled);
         assert_eq!(
             info.server_time,
             SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)
         );
+    }
+
+    fn valid_dead_letter_pb() -> pb::DeadLetterRecord {
+        pb::DeadLetterRecord {
+            job: Some(valid_job_pb()),
+            cause: pb::DeadLetterCause::AttemptsExhausted as i32,
+            failed_at: 1_700_000_100_000,
+            final_attempt: 5,
+            last_reason: Some("boom".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_ctx_carries_its_queue() {
+        let client = test_client();
+        let job = job_from_pb(&client, valid_job_pb(), None).unwrap();
+        assert_eq!(job.ctx.queue, "emails");
+    }
+
+    #[test]
+    fn dead_letter_cause_maps_from_pb() {
+        assert_eq!(
+            DeadLetterCause::from(pb::DeadLetterCause::AttemptsExhausted),
+            DeadLetterCause::AttemptsExhausted
+        );
+        assert_eq!(
+            DeadLetterCause::from(pb::DeadLetterCause::Rejected),
+            DeadLetterCause::Rejected
+        );
+        assert_eq!(
+            DeadLetterCause::from(pb::DeadLetterCause::LeaseExpired),
+            DeadLetterCause::LeaseExpired
+        );
+        assert_eq!(
+            DeadLetterCause::from(pb::DeadLetterCause::Unspecified),
+            DeadLetterCause::Unspecified
+        );
+    }
+
+    #[test]
+    fn dead_letter_record_converts_from_pb() {
+        let r = dead_letter_record_from_pb(valid_dead_letter_pb()).unwrap();
+        assert_eq!(r.job_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(r.queue, "emails");
+        assert_eq!(r.job_type, "send_email");
+        assert_eq!(r.cause, DeadLetterCause::AttemptsExhausted);
+        assert_eq!(r.final_attempt, 5);
+        assert_eq!(r.last_reason.as_deref(), Some("boom"));
+        assert_eq!(r.priority.get(), 3);
+        assert_eq!(
+            r.enqueued_at,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)
+        );
+        assert_eq!(
+            r.failed_at,
+            SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_100_000)
+        );
+    }
+
+    #[test]
+    fn dead_letter_record_missing_job_is_an_error() {
+        let mut record = valid_dead_letter_pb();
+        record.job = None;
+        assert!(matches!(
+            dead_letter_record_from_pb(record),
+            Err(JobConversionError::MissingField("job"))
+        ));
+    }
+
+    #[test]
+    fn dead_letter_record_unknown_cause_maps_to_unspecified() {
+        let mut record = valid_dead_letter_pb();
+        record.cause = 9999; // a future variant this client does not know
+        let r = dead_letter_record_from_pb(record).unwrap();
+        assert_eq!(r.cause, DeadLetterCause::Unspecified);
+    }
+
+    #[test]
+    fn dead_letter_record_replays_into_its_queue() {
+        let mut job = valid_job_pb();
+        job.payload = Some(pb::Payload {
+            data: vec![1, 2, 3],
+            encoding: "json".into(),
+        });
+        let r = dead_letter_record_from_pb(pb::DeadLetterRecord {
+            job: Some(job),
+            ..valid_dead_letter_pb()
+        })
+        .unwrap();
+
+        let req: pb::EnqueueRequest = r.to_enqueue_request().into();
+        assert_eq!(req.queue, "emails");
+        assert_eq!(req.job_type, "send_email");
+        assert_eq!(req.priority, Some(3));
+        assert_eq!(req.payload.map(|p| p.data), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn dead_letter_record_converts_into_enqueue_request() {
+        // The owned `From` consumes the record so a caller can write
+        // `client.enqueue(record.into())` with no clone.
+        let r = dead_letter_record_from_pb(valid_dead_letter_pb()).unwrap();
+        let req: pb::EnqueueRequest = EnqueueRequest::from(r).into();
+        assert_eq!(req.queue, "emails");
+        assert_eq!(req.job_type, "send_email");
+        assert_eq!(req.priority, Some(3));
     }
 }

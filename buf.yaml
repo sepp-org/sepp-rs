@@ -9,7 +9,7 @@
 # who `cargo add`s this crate. This file exists only so editor tooling can
 # resolve the vendored imports, and to document how to refresh the snapshot:
 #
-#     buf export buf.build/sepp-org/sepp-proto:v1.0.0 -o proto
+#     buf export buf.build/sepp-org/sepp-proto:v1.0.1 -o proto
 version: v2
 modules:
   - path: proto

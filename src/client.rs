@@ -10,7 +10,9 @@
 //! [`extend`](SeppClient::extend) directly, or hand the client to a
 //! [`Worker`](crate::worker::Worker) and let it drive that loop.
 
-use crate::{EnqueueAck, JobRejection, ServerInfo, ServerInfoError, pb::sepp::v1 as pb};
+use crate::{
+    DeadLetterRecord, EnqueueAck, JobRejection, ServerInfo, ServerInfoError, pb::sepp::v1 as pb,
+};
 use std::{
     sync::{
         Arc,
@@ -676,6 +678,61 @@ impl SeppClient {
         .await?;
 
         Ok(ServerInfo::try_from(response)?)
+    }
+
+    #[tracing::instrument(
+        name = "sepp-rs.drain_dead_letters",
+        skip_all,
+        fields(
+            otel.kind = "client",
+            otel.status_code = tracing::field::Empty,
+            queue = queue.unwrap_or("<all>"),
+            drained = tracing::field::Empty,
+        )
+    )]
+    /// Drains dead-lettered jobs for inspection and manual replay.
+    ///
+    /// Returns up to `max` [`DeadLetterRecord`]s (oldest-first, optionally
+    /// filtered to one `queue`) and **removes them from the server**. This is
+    /// destructive: the records are gone once returned, so a dropped response
+    /// loses exactly that batch — for that reason it is **not** retried by the
+    /// [`RetryPolicy`]. Inspect each record, then replay any you want with
+    /// [`DeadLetterRecord::to_enqueue_request`].
+    ///
+    /// An empty result means nothing matched, which is indistinguishable from
+    /// dead-letter retention being disabled — check
+    /// [`ServerInfo::dead_letter_retention_enabled`](crate::ServerInfo::dead_letter_retention_enabled).
+    pub async fn drain_dead_letters(
+        &self,
+        queue: Option<&str>,
+        max: u32,
+    ) -> Result<Vec<DeadLetterRecord>, ClientError> {
+        let mut request = Request::new(pb::DrainDeadLettersRequest {
+            queue: queue.map(String::from),
+            max: Some(max.max(1)),
+        });
+        inject_metadata(&mut request);
+
+        let response = match self.inner.clone().drain_dead_letters(request).await {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                tracing::Span::current().record("otel.status_code", "error");
+                return Err(status.into());
+            }
+        };
+
+        let mut records = Vec::with_capacity(response.records.len());
+        for record in response.records {
+            match crate::dead_letter_record_from_pb(record) {
+                Ok(r) => records.push(r),
+                Err(e) => {
+                    warn!(error = %e, "skipping malformed dead-letter record in drain response")
+                }
+            }
+        }
+
+        tracing::Span::current().record("drained", records.len());
+        Ok(records)
     }
 }
 
