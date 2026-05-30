@@ -129,6 +129,7 @@ pub struct Worker {
     client: SeppClient,
     opts: ReserveOptions,
     handlers: HashMap<String, Handler>,
+    catch_all_handler: Option<Handler>,
     max_in_flight: usize,
     reserve_error_backoff: Duration,
     auto_extend: Option<AutoExtend>,
@@ -300,6 +301,7 @@ impl Worker {
             client,
             opts,
             handlers: HashMap::new(),
+            catch_all_handler: None,
             max_in_flight: 16,
             reserve_error_backoff: Duration::from_secs(1),
             auto_extend: None,
@@ -403,6 +405,16 @@ impl Worker {
         Ok(self)
     }
 
+    /// Registers a catch-all handler for job types without a specific handler.
+    pub fn with_catch_all_handler<F, Fut>(mut self, h: F) -> Self
+    where
+        F: Fn(Option<Payload>, Arc<JobCtx>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), HandlerError>> + Send + 'static,
+    {
+        self.catch_all_handler = Some(wrap_handler(h));
+        self
+    }
+
     /// Registers a handler, overwriting any existing one for the same
     /// `job_type` instead of erroring.
     pub fn replace_handler<F, Fut>(mut self, job_type: &str, h: F) -> Self
@@ -493,12 +505,21 @@ impl Worker {
             {
                 let client = self.client.clone();
                 let handlers = Arc::clone(&handlers);
+                let catch_all_handler = self.catch_all_handler.clone();
                 let metrics = Arc::clone(&metrics);
                 let in_flight = InFlightGuard::new(Arc::clone(&metrics));
                 tokio::spawn(async move {
                     let _permit = permit; // held for the job's lifetime
                     let _in_flight = in_flight;
-                    process_job(&client, &handlers, auto_extend, first, &metrics).await;
+                    process_job(
+                        &client,
+                        &handlers,
+                        &catch_all_handler,
+                        auto_extend,
+                        first,
+                        &metrics,
+                    )
+                    .await;
                 });
             }
 
@@ -510,12 +531,21 @@ impl Worker {
                     .expect("semaphore is never closed");
                 let client = self.client.clone();
                 let handlers = Arc::clone(&handlers);
+                let catch_all_handler = self.catch_all_handler.clone();
                 let metrics = Arc::clone(&metrics);
                 let in_flight = InFlightGuard::new(Arc::clone(&metrics));
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _in_flight = in_flight;
-                    process_job(&client, &handlers, auto_extend, job, &metrics).await;
+                    process_job(
+                        &client,
+                        &handlers,
+                        &catch_all_handler,
+                        auto_extend,
+                        job,
+                        &metrics,
+                    )
+                    .await;
                 });
             }
         }
@@ -532,6 +562,7 @@ impl Worker {
 async fn process_job(
     client: &SeppClient,
     handlers: &HashMap<String, Handler>,
+    catch_all_handler: &Option<Handler>,
     auto_extend: Option<AutoExtend>,
     job: Job,
     metrics: &Metrics,
@@ -556,14 +587,22 @@ async fn process_job(
         span.add_link(link);
     }
 
-    run_job(client, handlers, auto_extend, job, metrics)
-        .instrument(span)
-        .await
+    run_job(
+        client,
+        handlers,
+        catch_all_handler,
+        auto_extend,
+        job,
+        metrics,
+    )
+    .instrument(span)
+    .await
 }
 
 async fn run_job(
     client: &SeppClient,
     handlers: &HashMap<String, Handler>,
+    catch_all_handler: &Option<Handler>,
     auto_extend: Option<AutoExtend>,
     job: Job,
     metrics: &Metrics,
@@ -572,7 +611,7 @@ async fn run_job(
     let lease = ctx.lease.clone();
     let ctx = Arc::new(ctx);
 
-    let Some(handler) = handlers.get(&ctx.job_type) else {
+    let Some(handler) = handlers.get(&ctx.job_type).or(catch_all_handler.as_ref()) else {
         warn!("no handler registered for job_type `{}`", ctx.job_type);
 
         let _ = client
