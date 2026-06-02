@@ -3,7 +3,9 @@ syntax = "proto3";
 package sepp.v1;
 
 import "buf/validate/validate.proto";
+import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
 
 // ============================================================================
 // Service definitions
@@ -130,9 +132,8 @@ message Job {
   // Trace context for tracing continuation.
   optional TraceContext trace_context = 5;
 
-  // Wall-clock time when the producer enqueued this job. Milliseconds
-  // since Unix epoch UTC.
-  int64 enqueued_at = 6 [(buf.validate.field).int64.gt = 0];
+  // Wall-clock time when the producer enqueued this job.
+  google.protobuf.Timestamp enqueued_at = 6 [(buf.validate.field).required = true];
 
   // Which attempt at this job this delivery pertains to. 1 on first delivery, incremented on each redelivery.
   uint32 attempt = 7 [(buf.validate.field).uint32.gte = 1];
@@ -140,9 +141,9 @@ message Job {
   // How many attempts are allowed before this job goes to dead-letter.
   uint32 max_attempts = 8 [(buf.validate.field).uint32.gte = 1];
 
-  // Wall-clock time when the lease on this job expires. Milliseconds since Unix epoch UTC.
+  // Wall-clock time when the lease on this job expires.
   // If the worker has not acked/nacked/extended by this time, the job becomes available for redelivery.
-  int64 lease_expires_at = 9 [(buf.validate.field).int64.gt = 0];
+  google.protobuf.Timestamp lease_expires_at = 9 [(buf.validate.field).required = true];
 
   // Custom key-value pairs.
   map<string, PrimitiveValue> custom = 10 [(buf.validate.field).map = {
@@ -152,7 +153,7 @@ message Job {
   }];
 
   // Schedule for future execution. If unset, the job is available immediately.
-  optional int64 scheduled_at = 11 [(buf.validate.field).int64.gt = 0];
+  google.protobuf.Timestamp scheduled_at = 11;
 
   // The queue this job belongs to. Populated on jobs returned by Reserve and on
   // the job embedded in a DeadLetterRecord, so a worker reserving from several
@@ -200,7 +201,7 @@ message JobRejection {
     // idempotency_key exceeds max_idempotency_key_bytes.
     IdempotencyKeyTooLong idempotency_key_too_long = 10;
 
-    // scheduled_at is further out than max_schedule_horizon_ms.
+    // scheduled_at is further out than max_schedule_horizon.
     ScheduledTooFar scheduled_too_far = 11;
 
     // Structural validation failed (e.g. required field missing).
@@ -259,8 +260,13 @@ message IdempotencyKeyTooLong {
 }
 
 message ScheduledTooFar {
-  uint64 horizon_ms = 1;
-  int64 actual_ms = 2;
+  // The server's configured maximum schedule horizon (how far ahead
+  // scheduled_at may be set, measured from the time of the request).
+  google.protobuf.Duration horizon = 1;
+
+  // The absolute scheduled_at the producer requested, which exceeded
+  // now + horizon.
+  google.protobuf.Timestamp actual = 2;
 }
 
 message InvalidRequest {
@@ -304,7 +310,7 @@ message EnqueueRequest {
   }];
 
   // Schedule for future execution. If unset, the job is available immediately.
-  optional int64 scheduled_at = 9 [(buf.validate.field).int64.gt = 0];
+  google.protobuf.Timestamp scheduled_at = 9;
 }
 
 // Response for an EnqueueRequest. Contains the assigned job ID and whether this was a duplicate.
@@ -388,16 +394,19 @@ message ReserveRequest {
     }
   }];
 
-  // How long the worker is willing to wait for a job, in milliseconds.
+  // How long the worker is willing to wait for a job.
   // If no job is available within this window, the response has no jobs.
-  // The server clamps this to its configured max (max_wait_timeout_ms,
+  // The server clamps this to its configured max (max_wait_timeout,
   // advertised in GetServerInfo); a larger value is not an error.
-  uint64 wait_timeout_ms = 2;
+  google.protobuf.Duration wait_timeout = 2 [(buf.validate.field).duration.gte = {}];
 
   // Lease duration the worker wants. Server may clamp to its configured max
-  // (max_lease_duration_ms, advertised in GetServerInfo). The worker must ack,
-  // nack, or extend before this time elapses, or the job will be redelivered.
-  uint64 lease_duration_ms = 3 [(buf.validate.field).uint64.gte = 1];
+  // (max_lease_duration, advertised in GetServerInfo). The worker must ack,
+  // nack, or extend before this elapses, or the job will be redelivered.
+  google.protobuf.Duration lease_duration = 3 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).duration.gt = {}
+  ];
 
   // A stable worker identifier, useful for observability and
   // sticky-routing future features.
@@ -456,8 +465,8 @@ message NackRetry {
     // Use the queue's default retry policy.
     google.protobuf.Empty default = 1;
 
-    // Retry after this many milliseconds.
-    uint64 delay_ms = 2;
+    // Retry after this delay.
+    google.protobuf.Duration delay = 2 [(buf.validate.field).duration.gte = {}];
 
     // Don't retry; move directly to dead-letter.
     google.protobuf.Empty dead_letter = 3;
@@ -477,8 +486,11 @@ message ExtendRequest {
   // The attempt for which this extend applies. Used to prevent extending a job that has been redelivered.
   uint32 attempt = 2 [(buf.validate.field).uint32.gte = 1];
 
-  // How much longer to extend the lease, in milliseconds, measured from now.
-  uint64 lease_duration_ms = 3 [(buf.validate.field).uint64.gt = 0];
+  // How much longer to extend the lease, measured from now.
+  google.protobuf.Duration lease_duration = 3 [
+    (buf.validate.field).required = true,
+    (buf.validate.field).duration.gt = {}
+  ];
 
   // Worker identifier for observability.
   optional string worker_id = 4 [(buf.validate.field).string.min_len = 1];
@@ -487,8 +499,8 @@ message ExtendRequest {
 message ExtendResponse {
   string job_id = 1 [(buf.validate.field).string.uuid = true];
 
-  // New lease expiration. Milliseconds since Unix epoch UTC.
-  int64 lease_expires_at = 2 [(buf.validate.field).int64.gt = 0];
+  // New lease expiration.
+  google.protobuf.Timestamp lease_expires_at = 2 [(buf.validate.field).required = true];
 }
 
 // ============================================================================
@@ -519,15 +531,15 @@ enum DeadLetterCause {
 message DeadLetterRecord {
   // The dead-lettered job, as a snapshot at failure time: the stored job
   // augmented with its queue and payload. Transient fields such as
-  // lease_expires_at may be 0 or stale, so do not validate it as a live Job — to
+  // lease_expires_at may be unset or stale, so do not validate it as a live Job — to
   // replay, copy its fields into an EnqueueRequest.
   Job job = 1;
 
   // Why the job was dead-lettered.
   DeadLetterCause cause = 2;
 
-  // Wall-clock time the job was dead-lettered. Milliseconds since Unix epoch UTC.
-  int64 failed_at = 3 [(buf.validate.field).int64.gt = 0];
+  // Wall-clock time the job was dead-lettered.
+  google.protobuf.Timestamp failed_at = 3 [(buf.validate.field).required = true];
 
   // The attempt number the job died on (1-based).
   uint32 final_attempt = 4 [(buf.validate.field).uint32.gte = 1];
@@ -573,9 +585,8 @@ message GetServerInfoResponse {
     }
   }];
 
-  // Server-side time, milliseconds since Unix epoch UTC. Useful for clients
-  // to detect clock skew.
-  int64 server_time_ms = 3 [(buf.validate.field).int64.gt = 0];
+  // Server-side time. Useful for clients to detect clock skew.
+  google.protobuf.Timestamp server_time = 3 [(buf.validate.field).required = true];
 
   // If true, the server will reject all encodings not explicitly listed in allowed_encodings.
   // If false, the server accepts all encodings, regardless of allowed_encodings.
@@ -599,8 +610,8 @@ message GetServerInfoResponse {
   // Max bytes in an idempotency_key (-> IdempotencyKeyTooLong).
   uint32 max_idempotency_key_bytes = 12;
 
-  // How far ahead scheduled_at may be set, in milliseconds (-> ScheduledTooFar).
-  uint64 max_schedule_horizon_ms = 13;
+  // How far ahead scheduled_at may be set (-> ScheduledTooFar).
+  google.protobuf.Duration max_schedule_horizon = 13;
 
   // Max jobs accepted in a single EnqueueBatch/EnqueueAtomic request. Batches
   // larger than this fail the whole request with INVALID_ARGUMENT.
@@ -615,18 +626,18 @@ message GetServerInfoResponse {
   // Max queues a single Reserve may list (exceeding this is INVALID_ARGUMENT).
   uint32 max_reserve_queues = 16;
 
-  // Max long-poll wait, in milliseconds (clamps ReserveRequest.wait_timeout_ms).
-  uint64 max_wait_timeout_ms = 17;
+  // Max long-poll wait (clamps ReserveRequest.wait_timeout).
+  google.protobuf.Duration max_wait_timeout = 17;
 
-  // Max lease duration, in milliseconds (clamps ReserveRequest.lease_duration_ms).
-  uint64 max_lease_duration_ms = 18;
+  // Max lease duration (clamps ReserveRequest.lease_duration).
+  google.protobuf.Duration max_lease_duration = 18;
 
   // If true, the server is in strict mode: enqueueing to an undeclared queue is
   // rejected with UnknownQueue. If false, queues are created on demand.
   bool strict_queues = 19;
 
-  // If true, the server retains dead-lettered jobs (dead_letter_retention_ms > 0)
-  // and DrainDeadLetters can return them. If false, dead jobs are deleted on
+  // If true, the server retains dead-lettered jobs (a positive retention window
+  // is configured) and DrainDeadLetters can return them. If false, dead jobs are deleted on
   // dead-letter and DrainDeadLetters always returns an empty list.
   bool dead_letter_retention_enabled = 20;
 }

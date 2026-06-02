@@ -1096,6 +1096,7 @@ dependencies = [
  "prost-build",
  "prost-reflect",
  "prost-reflect-build",
+ "prost-types",
  "protoc-bin-vendored",
  "serde",
  "serde_json",

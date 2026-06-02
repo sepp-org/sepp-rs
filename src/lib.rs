@@ -612,7 +612,7 @@ impl EnqueueRequest {
 
     /// Delays the job until the given time. The job is not delivered to any
     /// worker before then. Must be within the server's
-    /// [`max_schedule_horizon_ms`](ServerInfo::max_schedule_horizon_ms), or the
+    /// [`max_schedule_horizon`](ServerInfo::max_schedule_horizon), or the
     /// job is rejected with [`JobRejection::ScheduledTooFar`].
     pub fn with_scheduled_at(mut self, scheduled_at: SystemTime) -> Self {
         self.scheduled_at = Some(scheduled_at);
@@ -631,10 +631,11 @@ impl From<EnqueueRequest> for crate::pb::sepp::v1::EnqueueRequest {
             max_attempts: req.max_attempts,
             custom: req.custom.into_iter().map(|(k, v)| (k, v.into())).collect(),
             trace_context: req.trace_context.map(Into::into),
+
             scheduled_at: req
                 .scheduled_at
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64),
+                .filter(|t| t.duration_since(SystemTime::UNIX_EPOCH).is_ok())
+                .map(system_time_to_timestamp),
         }
     }
 }
@@ -720,9 +721,12 @@ pub enum JobRejection {
     #[error("idempotency_key is {actual} bytes, exceeding the limit of {limit}")]
     IdempotencyKeyTooLong { limit: u32, actual: u64 },
     /// [`scheduled_at`](EnqueueRequest::with_scheduled_at) is further out than
-    /// [`max_schedule_horizon_ms`](ServerInfo::max_schedule_horizon_ms).
-    #[error("scheduled_at {actual_ms}ms is beyond max_schedule_horizon_ms ({horizon_ms}ms)")]
-    ScheduledTooFar { horizon_ms: u64, actual_ms: i64 },
+    /// [`max_schedule_horizon`](ServerInfo::max_schedule_horizon).
+    #[error("scheduled_at {actual:?} is beyond the max schedule horizon ({horizon:?})")]
+    ScheduledTooFar {
+        horizon: Duration,
+        actual: SystemTime,
+    },
     /// The request failed the server's structural validation (e.g. a required
     /// field was missing); `message` carries the detail.
     #[error("structural validation failed: {message}")]
@@ -776,8 +780,8 @@ impl From<crate::pb::sepp::v1::JobRejection> for JobRejection {
                 actual: x.actual,
             },
             Some(Reason::ScheduledTooFar(x)) => Self::ScheduledTooFar {
-                horizon_ms: x.horizon_ms,
-                actual_ms: x.actual_ms,
+                horizon: proto_duration_to_std(x.horizon),
+                actual: timestamp_to_system_time(x.actual).unwrap_or(SystemTime::UNIX_EPOCH),
             },
             Some(Reason::InvalidRequest(x)) => Self::InvalidRequest { message: x.message },
             None => Self::Unknown,
@@ -965,11 +969,6 @@ fn primitive_from_pb(v: crate::pb::sepp::v1::PrimitiveValue) -> Option<Primitive
     })
 }
 
-fn millis_to_system_time(ms: i64) -> Option<SystemTime> {
-    let ms = u64::try_from(ms).ok()?;
-    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms))
-}
-
 pub(crate) fn system_time_to_millis(t: SystemTime) -> i64 {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -978,6 +977,40 @@ pub(crate) fn system_time_to_millis(t: SystemTime) -> i64 {
 
 pub(crate) fn now_millis() -> i64 {
     system_time_to_millis(SystemTime::now())
+}
+
+pub(crate) fn timestamp_to_system_time(ts: Option<prost_types::Timestamp>) -> Option<SystemTime> {
+    let ts = ts?;
+    if ts.seconds < 0 || (ts.seconds == 0 && ts.nanos < 0) {
+        return None;
+    }
+    SystemTime::try_from(ts).ok()
+}
+
+fn system_time_to_timestamp(t: SystemTime) -> prost_types::Timestamp {
+    prost_types::Timestamp::from(t)
+}
+
+fn proto_timestamp_to_millis(ts: Option<&prost_types::Timestamp>) -> i64 {
+    match ts {
+        Some(ts) => ts
+            .seconds
+            .saturating_mul(1_000)
+            .saturating_add(i64::from(ts.nanos) / 1_000_000),
+        None => 0,
+    }
+}
+
+pub(crate) fn duration_to_proto(d: Duration) -> prost_types::Duration {
+    prost_types::Duration::try_from(d).unwrap_or(prost_types::Duration {
+        seconds: i64::MAX,
+        nanos: 999_999_999,
+    })
+}
+
+fn proto_duration_to_std(d: Option<prost_types::Duration>) -> Duration {
+    d.and_then(|d| Duration::try_from(d).ok())
+        .unwrap_or(Duration::ZERO)
 }
 
 pub(crate) fn job_from_pb(
@@ -999,14 +1032,16 @@ pub(crate) fn job_from_pb(
         .and_then(|p| Priority::new(p).ok())
         .ok_or(E::PriorityOutOfRange(j.priority))?;
 
-    let enqueued_at = millis_to_system_time(j.enqueued_at).ok_or(E::InvalidTimestamp {
+    let enqueued_at_ms = proto_timestamp_to_millis(j.enqueued_at.as_ref());
+    let enqueued_at = timestamp_to_system_time(j.enqueued_at).ok_or(E::InvalidTimestamp {
         field: "enqueued_at",
-        value: j.enqueued_at,
+        value: enqueued_at_ms,
     })?;
+    let lease_expires_at_ms = proto_timestamp_to_millis(j.lease_expires_at.as_ref());
     let lease_expires_at =
-        millis_to_system_time(j.lease_expires_at).ok_or(E::InvalidTimestamp {
+        timestamp_to_system_time(j.lease_expires_at).ok_or(E::InvalidTimestamp {
             field: "lease_expires_at",
-            value: j.lease_expires_at,
+            value: lease_expires_at_ms,
         })?;
 
     let mut custom = HashMap::with_capacity(j.custom.len());
@@ -1114,7 +1149,7 @@ impl ReserveOptions {
 
     /// Sets how long the server holds the connection open waiting for a job
     /// before returning empty. The server clamps this to its configured
-    /// [`max_wait_timeout_ms`](ServerInfo::max_wait_timeout_ms).
+    /// [`max_wait_timeout`](ServerInfo::max_wait_timeout).
     pub fn with_wait_timeout(mut self, wait: Duration) -> Self {
         self.wait_timeout = wait;
         self
@@ -1155,8 +1190,8 @@ impl From<&ReserveOptions> for crate::pb::sepp::v1::ReserveRequest {
     fn from(o: &ReserveOptions) -> Self {
         Self {
             queues: o.queues.clone(),
-            wait_timeout_ms: o.wait_timeout.as_millis() as u64,
-            lease_duration_ms: o.lease_duration.as_millis() as u64,
+            wait_timeout: Some(duration_to_proto(o.wait_timeout)),
+            lease_duration: Some(duration_to_proto(o.lease_duration)),
             worker_id: o.worker_id.clone(),
             max_jobs: o.max_jobs,
         }
@@ -1199,18 +1234,18 @@ pub struct ServerInfo {
     pub max_job_type_bytes: u32,
     /// Maximum bytes in an idempotency key (→ [`JobRejection::IdempotencyKeyTooLong`]).
     pub max_idempotency_key_bytes: u32,
-    /// How far ahead a job may be scheduled, in ms (→ [`JobRejection::ScheduledTooFar`]).
-    pub max_schedule_horizon_ms: u64,
+    /// How far ahead a job may be scheduled (→ [`JobRejection::ScheduledTooFar`]).
+    pub max_schedule_horizon: Duration,
     /// Maximum jobs in one enqueue batch; larger batches fail the whole request.
     pub max_enqueue_batch: u32,
     /// Maximum jobs returned by one reserve; larger requests are clamped, not rejected.
     pub max_reserve_batch: u32,
     /// Maximum queues one reserve may list; exceeding this is an error.
     pub max_reserve_queues: u32,
-    /// Maximum long-poll wait in ms; larger requests are clamped.
-    pub max_wait_timeout_ms: u64,
-    /// Maximum lease duration in ms; larger requests are clamped.
-    pub max_lease_duration_ms: u64,
+    /// Maximum long-poll wait; larger requests are clamped.
+    pub max_wait_timeout: Duration,
+    /// Maximum lease duration; larger requests are clamped.
+    pub max_lease_duration: Duration,
     /// If `true`, enqueueing to an undeclared queue is rejected with
     /// [`JobRejection::UnknownQueue`]; if `false`, queues are created on demand.
     pub strict_queues: bool,
@@ -1239,8 +1274,9 @@ impl TryFrom<crate::pb::sepp::v1::GetServerInfoResponse> for ServerInfo {
         if r.server_version.is_empty() {
             return Err(ServerInfoError::MissingField("server_version"));
         }
-        let server_time = millis_to_system_time(r.server_time_ms)
-            .ok_or(ServerInfoError::InvalidServerTime(r.server_time_ms))?;
+        let server_time_ms = proto_timestamp_to_millis(r.server_time.as_ref());
+        let server_time = timestamp_to_system_time(r.server_time)
+            .ok_or(ServerInfoError::InvalidServerTime(server_time_ms))?;
 
         Ok(Self {
             version: r.server_version,
@@ -1255,12 +1291,12 @@ impl TryFrom<crate::pb::sepp::v1::GetServerInfoResponse> for ServerInfo {
             max_queue_name_bytes: r.max_queue_name_bytes,
             max_job_type_bytes: r.max_job_type_bytes,
             max_idempotency_key_bytes: r.max_idempotency_key_bytes,
-            max_schedule_horizon_ms: r.max_schedule_horizon_ms,
+            max_schedule_horizon: proto_duration_to_std(r.max_schedule_horizon),
             max_enqueue_batch: r.max_enqueue_batch,
             max_reserve_batch: r.max_reserve_batch,
             max_reserve_queues: r.max_reserve_queues,
-            max_wait_timeout_ms: r.max_wait_timeout_ms,
-            max_lease_duration_ms: r.max_lease_duration_ms,
+            max_wait_timeout: proto_duration_to_std(r.max_wait_timeout),
+            max_lease_duration: proto_duration_to_std(r.max_lease_duration),
             strict_queues: r.strict_queues,
             dead_letter_retention_enabled: r.dead_letter_retention_enabled,
         })
@@ -1399,13 +1435,15 @@ pub(crate) fn dead_letter_record_from_pb(
         .and_then(|p| Priority::new(p).ok())
         .ok_or(E::PriorityOutOfRange(j.priority))?;
 
-    let enqueued_at = millis_to_system_time(j.enqueued_at).ok_or(E::InvalidTimestamp {
+    let enqueued_at_ms = proto_timestamp_to_millis(j.enqueued_at.as_ref());
+    let enqueued_at = timestamp_to_system_time(j.enqueued_at).ok_or(E::InvalidTimestamp {
         field: "enqueued_at",
-        value: j.enqueued_at,
+        value: enqueued_at_ms,
     })?;
-    let failed_at = millis_to_system_time(r.failed_at).ok_or(E::InvalidTimestamp {
+    let failed_at_ms = proto_timestamp_to_millis(r.failed_at.as_ref());
+    let failed_at = timestamp_to_system_time(r.failed_at).ok_or(E::InvalidTimestamp {
         field: "failed_at",
-        value: r.failed_at,
+        value: failed_at_ms,
     })?;
 
     let mut custom = HashMap::with_capacity(j.custom.len());
@@ -1758,7 +1796,7 @@ mod tests {
         assert_eq!(pb.max_attempts, Some(5));
         assert_eq!(pb.custom.len(), 1);
         assert!(pb.trace_context.is_some());
-        assert_eq!(pb.scheduled_at, Some(1234));
+        assert_eq!(pb.scheduled_at, Some(ts(1, 234_000_000)));
     }
 
     #[test]
@@ -1956,17 +1994,18 @@ mod tests {
     fn job_rejection_scheduled_too_far() {
         let pb = rej(pb::job_rejection::Reason::ScheduledTooFar(
             pb::ScheduledTooFar {
-                horizon_ms: 60_000,
-                actual_ms: 120_000,
+                horizon: Some(prost_types::Duration {
+                    seconds: 60,
+                    nanos: 0,
+                }),
+                actual: Some(ts(120, 0)),
             },
         ));
-        assert!(matches!(
-            JobRejection::from(pb),
-            JobRejection::ScheduledTooFar {
-                horizon_ms: 60_000,
-                actual_ms: 120_000
-            }
-        ));
+        let JobRejection::ScheduledTooFar { horizon, actual } = JobRejection::from(pb) else {
+            panic!("expected ScheduledTooFar");
+        };
+        assert_eq!(horizon, Duration::from_secs(60));
+        assert_eq!(actual, SystemTime::UNIX_EPOCH + Duration::from_secs(120));
     }
 
     #[test]
@@ -2018,10 +2057,10 @@ mod tests {
             payload: None,
             priority: 3,
             trace_context: None,
-            enqueued_at: 1_700_000_000_000,
+            enqueued_at: Some(ts(1_700_000_000, 0)),
             attempt: 1,
             max_attempts: 5,
-            lease_expires_at: 1_700_000_060_000,
+            lease_expires_at: Some(ts(1_700_000_060, 0)),
             custom: HashMap::new(),
             scheduled_at: None,
             queue: "emails".into(),
@@ -2103,12 +2142,12 @@ mod tests {
     async fn job_from_pb_invalid_enqueued_at() {
         let client = test_client();
         let mut p = valid_job_pb();
-        p.enqueued_at = -1;
+        p.enqueued_at = Some(ts(-1, 0));
         assert!(matches!(
             job_from_pb(&client, p, None),
             Err(JobConversionError::InvalidTimestamp {
                 field: "enqueued_at",
-                value: -1
+                value: -1_000
             })
         ));
     }
@@ -2117,12 +2156,12 @@ mod tests {
     async fn job_from_pb_invalid_lease_expires_at() {
         let client = test_client();
         let mut p = valid_job_pb();
-        p.lease_expires_at = -5;
+        p.lease_expires_at = Some(ts(-5, 0));
         assert!(matches!(
             job_from_pb(&client, p, None),
             Err(JobConversionError::InvalidTimestamp {
                 field: "lease_expires_at",
-                value: -5
+                value: -5_000
             })
         ));
     }
@@ -2216,8 +2255,20 @@ mod tests {
             .with_max_jobs(7);
         let pb: pb::ReserveRequest = opts.into();
         assert_eq!(pb.queues, vec!["q1".to_string(), "q2".to_string()]);
-        assert_eq!(pb.wait_timeout_ms, 2_000);
-        assert_eq!(pb.lease_duration_ms, 5_000);
+        assert_eq!(
+            pb.wait_timeout,
+            Some(prost_types::Duration {
+                seconds: 2,
+                nanos: 0
+            })
+        );
+        assert_eq!(
+            pb.lease_duration,
+            Some(prost_types::Duration {
+                seconds: 5,
+                nanos: 0
+            })
+        );
         assert_eq!(pb.worker_id.as_deref(), Some("w"));
         assert_eq!(pb.max_jobs, Some(7));
     }
@@ -2230,23 +2281,71 @@ mod tests {
         assert_eq!(by_ref, by_val);
     }
 
-    #[test]
-    fn millis_to_system_time_zero() {
-        assert_eq!(millis_to_system_time(0), Some(SystemTime::UNIX_EPOCH));
+    fn ts(seconds: i64, nanos: i32) -> prost_types::Timestamp {
+        prost_types::Timestamp { seconds, nanos }
+    }
+
+    fn dur(seconds: i64) -> prost_types::Duration {
+        prost_types::Duration { seconds, nanos: 0 }
     }
 
     #[test]
-    fn millis_to_system_time_negative_is_none() {
-        assert!(millis_to_system_time(-1).is_none());
+    fn timestamp_to_system_time_epoch() {
+        assert_eq!(
+            timestamp_to_system_time(Some(ts(0, 0))),
+            Some(SystemTime::UNIX_EPOCH)
+        );
     }
 
     #[test]
-    fn millis_to_system_time_positive() {
-        let t = millis_to_system_time(1_700_000_000_000).unwrap();
+    fn timestamp_to_system_time_none_is_none() {
+        assert!(timestamp_to_system_time(None).is_none());
+    }
+
+    #[test]
+    fn timestamp_to_system_time_negative_is_none() {
+        assert!(timestamp_to_system_time(Some(ts(-1, 0))).is_none());
+    }
+
+    #[test]
+    fn timestamp_to_system_time_positive() {
+        let t = timestamp_to_system_time(Some(ts(1_700_000_000, 0))).unwrap();
         assert_eq!(
             t,
-            SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
         );
+    }
+
+    #[test]
+    fn system_time_to_timestamp_round_trip() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        let pb = system_time_to_timestamp(t);
+        assert_eq!(pb.seconds, 1_700_000_000);
+        assert_eq!(pb.nanos, 123_000_000);
+    }
+
+    #[test]
+    fn proto_timestamp_to_millis_handles_none_and_value() {
+        assert_eq!(proto_timestamp_to_millis(None), 0);
+        assert_eq!(
+            proto_timestamp_to_millis(Some(&ts(120, 500_000_000))),
+            120_500
+        );
+        assert_eq!(proto_timestamp_to_millis(Some(&ts(-5, 0))), -5_000);
+    }
+
+    #[test]
+    fn duration_to_proto_round_trip() {
+        let pb = duration_to_proto(Duration::from_millis(5_000));
+        assert_eq!(pb.seconds, 5);
+        assert_eq!(pb.nanos, 0);
+    }
+
+    #[test]
+    fn duration_to_proto_saturates_on_overflow() {
+        let pb = duration_to_proto(Duration::new(u64::MAX, 0));
+        assert_eq!(pb.seconds, i64::MAX);
+        assert_eq!(pb.nanos, 999_999_999);
     }
 
     #[test]
@@ -2270,7 +2369,7 @@ mod tests {
         pb::GetServerInfoResponse {
             server_version: "1.2.3".into(),
             supported_protocol_versions: vec!["v1".into()],
-            server_time_ms: 1_700_000_000_000,
+            server_time: Some(ts(1_700_000_000, 0)),
             restricts_encodings: false,
             allowed_encodings: vec!["json".into()],
             max_payload_bytes: 1024,
@@ -2280,12 +2379,12 @@ mod tests {
             max_queue_name_bytes: 512,
             max_job_type_bytes: 256,
             max_idempotency_key_bytes: 128,
-            max_schedule_horizon_ms: 86_400_000,
+            max_schedule_horizon: Some(dur(86_400)),
             max_enqueue_batch: 100,
             max_reserve_batch: 50,
             max_reserve_queues: 8,
-            max_wait_timeout_ms: 30_000,
-            max_lease_duration_ms: 60_000,
+            max_wait_timeout: Some(dur(30)),
+            max_lease_duration: Some(dur(60)),
             strict_queues: true,
             dead_letter_retention_enabled: false,
         }
@@ -2304,10 +2403,10 @@ mod tests {
     #[test]
     fn server_info_invalid_server_time() {
         let mut p = valid_server_info_pb();
-        p.server_time_ms = -1;
+        p.server_time = Some(ts(-1, 0));
         assert!(matches!(
             ServerInfo::try_from(p),
-            Err(ServerInfoError::InvalidServerTime(-1))
+            Err(ServerInfoError::InvalidServerTime(-1_000))
         ));
     }
 
@@ -2325,12 +2424,12 @@ mod tests {
         assert_eq!(info.max_queue_name_bytes, 512);
         assert_eq!(info.max_job_type_bytes, 256);
         assert_eq!(info.max_idempotency_key_bytes, 128);
-        assert_eq!(info.max_schedule_horizon_ms, 86_400_000);
+        assert_eq!(info.max_schedule_horizon, Duration::from_secs(86_400));
         assert_eq!(info.max_enqueue_batch, 100);
         assert_eq!(info.max_reserve_batch, 50);
         assert_eq!(info.max_reserve_queues, 8);
-        assert_eq!(info.max_wait_timeout_ms, 30_000);
-        assert_eq!(info.max_lease_duration_ms, 60_000);
+        assert_eq!(info.max_wait_timeout, Duration::from_secs(30));
+        assert_eq!(info.max_lease_duration, Duration::from_secs(60));
         assert!(info.strict_queues);
         assert!(!info.dead_letter_retention_enabled);
         assert_eq!(
@@ -2343,7 +2442,7 @@ mod tests {
         pb::DeadLetterRecord {
             job: Some(valid_job_pb()),
             cause: pb::DeadLetterCause::AttemptsExhausted as i32,
-            failed_at: 1_700_000_100_000,
+            failed_at: Some(ts(1_700_000_100, 0)),
             final_attempt: 5,
             last_reason: Some("boom".into()),
         }

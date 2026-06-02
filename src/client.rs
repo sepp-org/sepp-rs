@@ -579,7 +579,9 @@ impl SeppClient {
     ) -> Result<bool, LeaseError> {
         let strategy = match retry {
             RetryDirective::Default => pb::nack_retry::Strategy::Default(()),
-            RetryDirective::After(d) => pb::nack_retry::Strategy::DelayMs(d.as_millis() as u64),
+            RetryDirective::After(d) => {
+                pb::nack_retry::Strategy::Delay(crate::duration_to_proto(d))
+            }
             RetryDirective::DeadLetter => pb::nack_retry::Strategy::DeadLetter(()),
         };
         let body = pb::NackRequest {
@@ -644,7 +646,7 @@ impl SeppClient {
         let body = pb::ExtendRequest {
             job_id: job_id.to_string(),
             attempt,
-            lease_duration_ms: extension.as_millis() as u64,
+            lease_duration: Some(crate::duration_to_proto(extension)),
             worker_id: worker_id.map(String::from),
         };
 
@@ -655,7 +657,7 @@ impl SeppClient {
             async move { inner.extend(request).await.map(|r| r.into_inner()) }
         })
         .await?;
-        crate::millis_to_system_time(response.lease_expires_at).ok_or_else(|| {
+        crate::timestamp_to_system_time(response.lease_expires_at).ok_or_else(|| {
             ClientError::MalformedResponse("extend returned an invalid lease_expires_at").into()
         })
     }
