@@ -651,7 +651,9 @@ async fn run_job(
     };
 
     if let Err(err) = dispose(client, &ctx, disposition, metrics).await {
-        error!("failed to ack/nack job; it will be redelivered after lease expiry: {err}");
+        error!(
+            "failed to ack/nack job: {err}; either the lease was lost and the job will be redelivered, or a retried attempt already succeeded and only its response was lost"
+        );
     }
 }
 

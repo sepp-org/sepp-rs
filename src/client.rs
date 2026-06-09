@@ -2,7 +2,7 @@
 //!
 //! [`SeppClient`] is a cheaply-cloneable handle to a Sepp server. Build one with
 //! [`SeppClient::connect`] for the common case, or [`SeppClient::builder`] to
-//! configure authentication, TLS, and an RPC [`RetryPolicy`]. All RPC methods
+//! configure authentication, TLS, timeouts, and an RPC [`RetryPolicy`]. All RPC methods
 //! take `&self`, so a single client can be shared across tasks by cloning.
 //!
 //! For consuming jobs you can call [`reserve`](SeppClient::reserve),
@@ -37,6 +37,7 @@ use crate::{
 };
 
 const RESERVE_DEADLINE_SLACK: Duration = Duration::from_secs(10);
+const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 type AuthChannel = InterceptedService<Channel, ApiKeyInterceptor>;
 
@@ -49,6 +50,7 @@ type AuthChannel = InterceptedService<Channel, ApiKeyInterceptor>;
 pub struct SeppClient {
     inner: QueueServiceClient<AuthChannel>,
     retry_policy: Arc<RetryPolicy>,
+    rpc_timeout: Duration,
 }
 
 const _: fn() = || {
@@ -155,7 +157,9 @@ impl From<tonic::Status> for EnqueueError {
 /// [`JobNotFound`](Self::JobNotFound) and [`AttemptMismatch`](Self::AttemptMismatch)
 /// both mean the worker no longer holds the lease — typically because it was
 /// allowed to expire and the job was redelivered. In that case any work the
-/// handler did may be processed again by another worker.
+/// handler did may be processed again by another worker. With a retrying
+/// [`RetryPolicy`], `JobNotFound` can also mean an earlier attempt of this
+/// same call succeeded and only its response was lost.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LeaseError {
@@ -325,7 +329,18 @@ impl SeppClient {
         Self {
             inner: QueueServiceClient::with_interceptor(channel, ApiKeyInterceptor::disabled()),
             retry_policy: Arc::new(RetryPolicy::default()),
+            rpc_timeout: DEFAULT_RPC_TIMEOUT,
         }
+    }
+
+    /// Builds a unary request with the client's RPC deadline and trace metadata
+    /// applied. Reserve builds its own request: its deadline follows the wait
+    /// timeout instead.
+    fn unary_request<T>(&self, body: T) -> Request<T> {
+        let mut request = Request::new(body);
+        request.set_timeout(self.rpc_timeout);
+        inject_metadata(&mut request);
+        request
     }
 
     #[tracing::instrument(
@@ -355,7 +370,7 @@ impl SeppClient {
         tracing::Span::current().record("jobs", sent);
 
         let response = with_retry(&self.retry_policy, "enqueue_batch", || {
-            let mut request = Request::new(pb::EnqueueBatchRequest { jobs: jobs.clone() });
+            let mut request = self.unary_request(pb::EnqueueBatchRequest { jobs: jobs.clone() });
             inject_trace_context(&mut request);
             let mut inner = self.inner.clone();
             async move { inner.enqueue_batch(request).await.map(|r| r.into_inner()) }
@@ -433,7 +448,7 @@ impl SeppClient {
         tracing::Span::current().record("jobs", sent);
 
         let response = with_retry(&self.retry_policy, "enqueue_atomic", || {
-            let mut request = Request::new(pb::EnqueueBatchRequest { jobs: jobs.clone() });
+            let mut request = self.unary_request(pb::EnqueueBatchRequest { jobs: jobs.clone() });
             inject_trace_context(&mut request);
             let mut inner = self.inner.clone();
             async move { inner.enqueue_atomic(request).await.map(|r| r.into_inner()) }
@@ -545,8 +560,7 @@ impl SeppClient {
             worker_id: ctx.lease.worker_id.clone(),
         };
         with_retry(&self.retry_policy, "ack", || {
-            let mut request = Request::new(body.clone());
-            inject_metadata(&mut request);
+            let request = self.unary_request(body.clone());
             let mut inner = self.inner.clone();
             async move { inner.ack(request).await.map(|_| ()) }
         })
@@ -595,8 +609,7 @@ impl SeppClient {
         };
 
         let response = with_retry(&self.retry_policy, "nack", || {
-            let mut request = Request::new(body.clone());
-            inject_metadata(&mut request);
+            let request = self.unary_request(body.clone());
             let mut inner = self.inner.clone();
             async move { inner.nack(request).await.map(|r| r.into_inner()) }
         })
@@ -651,8 +664,7 @@ impl SeppClient {
         };
 
         let response = with_retry(&self.retry_policy, "extend", || {
-            let mut request = Request::new(body.clone());
-            inject_metadata(&mut request);
+            let request = self.unary_request(body.clone());
             let mut inner = self.inner.clone();
             async move { inner.extend(request).await.map(|r| r.into_inner()) }
         })
@@ -673,7 +685,7 @@ impl SeppClient {
     /// the advertised limits and avoid round-trips that would only be rejected.
     pub async fn get_server_info(&self) -> Result<ServerInfo, ClientError> {
         let response = with_retry(&self.retry_policy, "get_server_info", || {
-            let request = Request::new(pb::GetServerInfoRequest {});
+            let request = self.unary_request(pb::GetServerInfoRequest {});
             let mut inner = self.inner.clone();
             async move { inner.get_server_info(request).await.map(|r| r.into_inner()) }
         })
@@ -709,11 +721,10 @@ impl SeppClient {
         queue: Option<&str>,
         max: u32,
     ) -> Result<Vec<DeadLetterRecord>, ClientError> {
-        let mut request = Request::new(pb::DrainDeadLettersRequest {
+        let request = self.unary_request(pb::DrainDeadLettersRequest {
             queue: queue.map(String::from),
             max: Some(max.max(1)),
         });
-        inject_metadata(&mut request);
 
         let response = match self.inner.clone().drain_dead_letters(request).await {
             Ok(response) => response.into_inner(),
@@ -814,6 +825,8 @@ pub struct SeppClientBuilder {
     addr: String,
     api_key: Option<String>,
     retry_policy: RetryPolicy,
+    rpc_timeout: Duration,
+    max_receive_message_bytes: Option<usize>,
     #[cfg(feature = "tls")]
     tls: Option<ClientTlsConfig>,
 }
@@ -824,6 +837,8 @@ impl SeppClientBuilder {
             addr: addr.into(),
             api_key: None,
             retry_policy: RetryPolicy::default(),
+            rpc_timeout: DEFAULT_RPC_TIMEOUT,
+            max_receive_message_bytes: None,
             #[cfg(feature = "tls")]
             tls: None,
         }
@@ -842,6 +857,28 @@ impl SeppClientBuilder {
     /// does not retry.
     pub fn retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
+        self
+    }
+
+    /// Sets the per-call deadline for every unary RPC except
+    /// [`reserve`](SeppClient::reserve), whose deadline follows the requested
+    /// wait timeout instead. Defaults to 30 seconds.
+    ///
+    /// Enqueuing very large batches may need a higher value.
+    pub fn rpc_timeout(mut self, timeout: Duration) -> Self {
+        self.rpc_timeout = timeout;
+        self
+    }
+
+    /// Sets the largest gRPC message this client accepts, replacing tonic's
+    /// 4 MiB default.
+    ///
+    /// Workers should consider raising this: a reserve response can carry up
+    /// to the server's `max_reserve_batch` × `max_payload_bytes`, which can
+    /// exceed the 4 MiB default, and an oversized response fails client-side
+    /// while its jobs stay leased until they expire.
+    pub fn max_receive_message_bytes(mut self, bytes: usize) -> Self {
+        self.max_receive_message_bytes = Some(bytes);
         self
     }
 
@@ -937,9 +974,15 @@ impl SeppClientBuilder {
             "connected to Sepp server",
         );
 
+        let mut inner = QueueServiceClient::with_interceptor(channel, interceptor);
+        if let Some(bytes) = self.max_receive_message_bytes {
+            inner = inner.max_decoding_message_size(bytes);
+        }
+
         Ok(SeppClient {
-            inner: QueueServiceClient::with_interceptor(channel, interceptor),
+            inner,
             retry_policy: Arc::new(self.retry_policy),
+            rpc_timeout: self.rpc_timeout,
         })
     }
 }
@@ -1090,7 +1133,8 @@ fn inject_trace_context(request: &mut Request<pb::EnqueueBatchRequest>) {
             }
         }
     }
-    inject_metadata(request);
+    #[cfg(not(feature = "opentelemetry"))]
+    let _ = request;
 }
 
 #[cfg(test)]
@@ -1427,5 +1471,33 @@ mod tests {
     #[test]
     fn retry_policy_default_is_no_retry() {
         assert_eq!(RetryPolicy::default().max_attempts(), 1);
+    }
+
+    #[test]
+    fn builder_defaults_rpc_timeout_and_message_size() {
+        let b = SeppClient::builder("http://localhost:1");
+        assert_eq!(b.rpc_timeout, DEFAULT_RPC_TIMEOUT);
+        assert!(b.max_receive_message_bytes.is_none());
+    }
+
+    #[test]
+    fn builder_rpc_timeout_overrides_default() {
+        let b = SeppClient::builder("http://localhost:1").rpc_timeout(Duration::from_secs(5));
+        assert_eq!(b.rpc_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn builder_max_receive_message_bytes_set() {
+        let b =
+            SeppClient::builder("http://localhost:1").max_receive_message_bytes(16 * 1024 * 1024);
+        assert_eq!(b.max_receive_message_bytes, Some(16 * 1024 * 1024));
+    }
+
+    #[tokio::test]
+    async fn unary_request_sets_grpc_timeout() {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = SeppClient::from_channel(channel);
+        let request = client.unary_request(());
+        assert!(request.metadata().contains_key("grpc-timeout"));
     }
 }
