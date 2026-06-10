@@ -662,9 +662,10 @@ impl From<crate::pb::sepp::v1::EnqueueResponse> for EnqueueAck {
 
 /// Why the server refused a single job.
 ///
-/// Every variant is *deterministic*: re-sending the same job against the same
-/// server state produces the same rejection. Transient problems (a storage
-/// outage, a dropped connection) are never reported here — they surface as a
+/// Every variant except [`QueueFull`](Self::QueueFull) is *deterministic*:
+/// re-sending the same job against the same server state produces the same
+/// rejection. Transient problems (a storage outage, a dropped connection) are
+/// never reported here — they surface as a
 /// [`ClientError`](client::ClientError) instead. Most limits behind these
 /// variants are advertised up front by [`ServerInfo`], so a producer can
 /// validate locally before sending.
@@ -731,6 +732,10 @@ pub enum JobRejection {
     /// field was missing); `message` carries the detail.
     #[error("structural validation failed: {message}")]
     InvalidRequest { message: String },
+    /// The target queue is at capacity (`limit` is its configured max depth).
+    /// The only non-deterministic rejection: it clears once the queue drains.
+    #[error("queue {queue:?} is full (max depth {limit})")]
+    QueueFull { queue: String, limit: u64 },
     /// The server sent a rejection reason this client version does not
     /// recognize.
     #[error("server returned an unrecognized rejection variant")]
@@ -784,6 +789,10 @@ impl From<crate::pb::sepp::v1::JobRejection> for JobRejection {
                 actual: timestamp_to_system_time(x.actual).unwrap_or(SystemTime::UNIX_EPOCH),
             },
             Some(Reason::InvalidRequest(x)) => Self::InvalidRequest { message: x.message },
+            Some(Reason::QueueFull(x)) => Self::QueueFull {
+                queue: x.queue,
+                limit: x.limit,
+            },
             None => Self::Unknown,
         }
     }
@@ -1303,7 +1312,7 @@ impl TryFrom<crate::pb::sepp::v1::GetServerInfoResponse> for ServerInfo {
     }
 }
 
-/// Why a job was moved to the server's dead-letter store. Mirrors the three
+/// Why a job was moved to the server's dead-letter store. Mirrors the
 /// terminal paths a job can take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1318,6 +1327,8 @@ pub enum DeadLetterCause {
     Rejected,
     /// The lease expired while the job was on its final attempt.
     LeaseExpired,
+    /// An operator dead-lettered the job through the admin API.
+    Admin,
 }
 
 impl From<crate::pb::sepp::v1::DeadLetterCause> for DeadLetterCause {
@@ -1328,6 +1339,7 @@ impl From<crate::pb::sepp::v1::DeadLetterCause> for DeadLetterCause {
             Pb::AttemptsExhausted => Self::AttemptsExhausted,
             Pb::Rejected => Self::Rejected,
             Pb::LeaseExpired => Self::LeaseExpired,
+            Pb::Admin => Self::Admin,
         }
     }
 }
@@ -2022,6 +2034,21 @@ mod tests {
     }
 
     #[test]
+    fn job_rejection_queue_full() {
+        let pb = rej(pb::job_rejection::Reason::QueueFull(pb::QueueFull {
+            queue: "q".into(),
+            limit: 1000,
+        }));
+        match JobRejection::from(pb) {
+            JobRejection::QueueFull { queue, limit } => {
+                assert_eq!(queue, "q");
+                assert_eq!(limit, 1000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn job_rejection_none_is_unknown() {
         let pb = pb::JobRejection { reason: None };
         assert!(matches!(JobRejection::from(pb), JobRejection::Unknown));
@@ -2470,9 +2497,26 @@ mod tests {
             DeadLetterCause::LeaseExpired
         );
         assert_eq!(
+            DeadLetterCause::from(pb::DeadLetterCause::Admin),
+            DeadLetterCause::Admin
+        );
+        assert_eq!(
             DeadLetterCause::from(pb::DeadLetterCause::Unspecified),
             DeadLetterCause::Unspecified
         );
+    }
+
+    #[test]
+    fn dead_letter_cause_raw_values_via_try_from() {
+        let mut record = valid_dead_letter_pb();
+        record.cause = 4;
+        let r = dead_letter_record_from_pb(record).unwrap();
+        assert_eq!(r.cause, DeadLetterCause::Admin);
+
+        let mut record = valid_dead_letter_pb();
+        record.cause = 99; // a future variant this client does not know
+        let r = dead_letter_record_from_pb(record).unwrap();
+        assert_eq!(r.cause, DeadLetterCause::Unspecified);
     }
 
     #[test]

@@ -1,7 +1,7 @@
-# This crate vendors the sepp wire contract under `proto/` (queue.proto plus its
-# transitive imports, e.g. buf/validate/validate.proto) and ships it in the
-# published crate. It is NOT the source of truth: the contract lives in the sepp
-# `proto` repo and is published to buf.build/sepp-org/sepp-proto, where
+# This crate vendors the sepp wire contract under `proto/` (queue.proto; it has
+# no transitive imports beyond the protobuf well-known types) and ships it in
+# the published crate. It is NOT the source of truth: the contract lives in the
+# sepp `proto` repo and is published to buf.build/sepp-org/sepp-proto, where
 # lint/breaking checks are enforced.
 #
 # buf is not part of the build — prost/tonic compile the vendored files directly
@@ -9,7 +9,7 @@
 # who `cargo add`s this crate. This file exists only so editor tooling can
 # resolve the vendored imports, and to document how to refresh the snapshot:
 #
-#     buf export buf.build/sepp-org/sepp-proto:v1.1.0 -o proto
+#     buf export buf.build/sepp-org/sepp-proto:v1.1.2 -o proto
 version: v2
 modules:
   - path: proto

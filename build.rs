@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the published crate). The version below is the one currently vendored; to
     // refresh, bump it to a newer published label/commit and re-run:
     //
-    //     buf export buf.build/sepp-org/sepp-proto:v1.1.0 -o proto
+    //     buf export buf.build/sepp-org/sepp-proto:v1.1.2 -o proto
     //
     // The build itself never invokes `buf` or touches the network, so it works
     // on docs.rs, in offline CI, and for anyone who `cargo add`s this crate.
@@ -17,7 +17,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");
     }
-    println!("cargo:rerun-if-changed=proto/buf/validate/validate.proto");
 
     let mut prost_config = prost_build::Config::new();
 
