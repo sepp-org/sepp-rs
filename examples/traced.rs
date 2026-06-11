@@ -111,8 +111,9 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     //    it back to the enqueue span recovered from the job's trace context.
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<String>(1);
 
-    let worker = Worker::new(client.clone(), [QUEUE], Duration::from_secs(30))?
-        .handle(JOB_TYPE, move |payload, ctx| {
+    let worker = Worker::new(client.clone(), [QUEUE], Duration::from_secs(30))?.handle(
+        JOB_TYPE,
+        move |payload, ctx| {
             let done_tx = done_tx.clone();
             async move {
                 let body = payload
@@ -123,7 +124,8 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = done_tx.send(ctx.id.clone()).await;
                 Ok(())
             }
-        })?;
+        },
+    )?;
     let worker_task = tokio::spawn(worker.run());
 
     // 3. Wait for the job to be processed, then tear the worker down.

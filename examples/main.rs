@@ -49,21 +49,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     //    the example can finish instead of looping in `run` forever.
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<String>(1);
 
-    let worker =
-        Worker::new(client.clone(), [QUEUE], Duration::from_secs(30))?.handle(
-            JOB_TYPE,
-            move |payload, ctx| {
-                let done_tx = done_tx.clone();
-                async move {
-                    let body = payload
-                        .map(|p| String::from_utf8_lossy(&p.data).into_owned())
-                        .unwrap_or_default();
-                    println!("worker: processing job {} — payload {body:?}", ctx.id);
-                    let _ = done_tx.send(ctx.id.clone()).await;
-                    Ok(())
-                }
-            },
-        )?;
+    let worker = Worker::new(client.clone(), [QUEUE], Duration::from_secs(30))?.handle(
+        JOB_TYPE,
+        move |payload, ctx| {
+            let done_tx = done_tx.clone();
+            async move {
+                let body = payload
+                    .map(|p| String::from_utf8_lossy(&p.data).into_owned())
+                    .unwrap_or_default();
+                println!("worker: processing job {} — payload {body:?}", ctx.id);
+                let _ = done_tx.send(ctx.id.clone()).await;
+                Ok(())
+            }
+        },
+    )?;
 
     let worker_task = tokio::spawn(worker.run());
 

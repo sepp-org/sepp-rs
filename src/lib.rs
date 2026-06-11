@@ -662,13 +662,13 @@ impl From<crate::pb::sepp::v1::EnqueueResponse> for EnqueueAck {
 
 /// Why the server refused a single job.
 ///
-/// Every variant except [`QueueFull`](Self::QueueFull) is *deterministic*:
-/// re-sending the same job against the same server state produces the same
-/// rejection. Transient problems (a storage outage, a dropped connection) are
-/// never reported here — they surface as a
-/// [`ClientError`](client::ClientError) instead. Most limits behind these
-/// variants are advertised up front by [`ServerInfo`], so a producer can
-/// validate locally before sending.
+/// Every variant except [`QueueFull`](Self::QueueFull) and
+/// [`QueueClosing`](Self::QueueClosing) is *deterministic*: re-sending the
+/// same job against the same server state produces the same rejection.
+/// Transient problems (a storage outage, a dropped connection) are never
+/// reported here — they surface as a [`ClientError`](client::ClientError)
+/// instead. Most limits behind these variants are advertised up front by
+/// [`ServerInfo`], so a producer can validate locally before sending.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum JobRejection {
@@ -733,9 +733,13 @@ pub enum JobRejection {
     #[error("structural validation failed: {message}")]
     InvalidRequest { message: String },
     /// The target queue is at capacity (`limit` is its configured max depth).
-    /// The only non-deterministic rejection: it clears once the queue drains.
+    /// Non-deterministic: it clears once the queue drains.
     #[error("queue {queue:?} is full (max depth {limit})")]
     QueueFull { queue: String, limit: u64 },
+    /// The target queue is being deleted and is not accepting new jobs.
+    /// Non-deterministic: it clears once the delete completes or is abandoned.
+    #[error("queue {queue:?} is being deleted and is not accepting new jobs")]
+    QueueClosing { queue: String },
     /// The server sent a rejection reason this client version does not
     /// recognize.
     #[error("server returned an unrecognized rejection variant")]
@@ -793,6 +797,7 @@ impl From<crate::pb::sepp::v1::JobRejection> for JobRejection {
                 queue: x.queue,
                 limit: x.limit,
             },
+            Some(Reason::QueueClosing(x)) => Self::QueueClosing { queue: x.queue },
             None => Self::Unknown,
         }
     }
@@ -2044,6 +2049,17 @@ mod tests {
                 assert_eq!(queue, "q");
                 assert_eq!(limit, 1000);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_rejection_queue_closing() {
+        let pb = rej(pb::job_rejection::Reason::QueueClosing(pb::QueueClosing {
+            queue: "q".into(),
+        }));
+        match JobRejection::from(pb) {
+            JobRejection::QueueClosing { queue } => assert_eq!(queue, "q"),
             _ => panic!("wrong variant"),
         }
     }

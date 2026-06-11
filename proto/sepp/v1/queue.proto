@@ -163,11 +163,12 @@ message Job {
 }
 
 // Reason a single job in an enqueue batch was rejected. Every variant except
-// queue_full is deterministic: retrying the same job against the same server
-// configuration produces the same outcome. queue_full reflects queue depth at
-// admission time and clears once the queue drains. Transient server failures
-// (e.g. storage outage) are still reported as a whole-batch gRPC error, never
-// as a JobRejection.
+// queue_full and queue_closing is deterministic: retrying the same job against
+// the same server configuration produces the same outcome. queue_full reflects
+// queue depth at admission time and clears once the queue drains; queue_closing
+// reflects an in-progress queue deletion and clears once that finishes or is
+// abandoned. Transient server failures (e.g. storage outage) are still reported
+// as a whole-batch gRPC error, never as a JobRejection.
 //
 // Servers may add rejection reasons over time. Clients must treat a rejection
 // whose reason they do not recognize as a rejection of unknown kind, not as a
@@ -210,9 +211,15 @@ message JobRejection {
     // Structural validation failed (e.g. required field missing).
     InvalidRequest invalid_request = 12;
 
-    // The target queue is at capacity (max_queue_depth). The only
-    // non-deterministic rejection: it clears once the queue drains.
+    // The target queue is at capacity (max_queue_depth). Non-deterministic:
+    // it clears once the queue drains.
     QueueFull queue_full = 13;
+
+    // The target queue is being deleted (an operator delete is draining it),
+    // so it is not currently accepting new jobs. Non-deterministic: it clears
+    // once the delete completes or is abandoned. Retry against another queue,
+    // or retry this queue after the delete finishes.
+    QueueClosing queue_closing = 14;
   }
 }
 
@@ -285,6 +292,10 @@ message QueueFull {
 
   // The queue's configured max_queue_depth.
   uint64 limit = 2;
+}
+
+message QueueClosing {
+  string queue = 1;
 }
 
 // ============================================================================

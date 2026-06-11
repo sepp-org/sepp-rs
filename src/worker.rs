@@ -139,7 +139,12 @@ pub struct Worker {
 
 #[derive(Debug, Clone, Copy)]
 struct AutoExtend {
-    interval: Duration,
+    // None = derive the interval from the granted lease each cycle (default);
+    // Some = the caller's explicit interval. The default must track the GRANTED
+    // lease, not the requested one: if the server clamps the lease below the
+    // request, a requested-lease/3 interval fires only after the granted lease
+    // has already expired, so the job is redelivered and runs twice.
+    explicit_interval: Option<Duration>,
     extend_by: Duration,
 }
 
@@ -320,7 +325,13 @@ impl Worker {
     /// Caps how many jobs a single reserve may return. The worker already
     /// limits this to its free in-flight capacity, so set this only to request
     /// fewer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max` is 0. The server requires `max_jobs >= 1` and would
+    /// reject every reserve, hanging the worker.
     pub fn with_max_jobs(mut self, max: u32) -> Self {
+        assert!(max >= 1, "max_jobs must be at least 1");
         self.opts.max_jobs = Some(max);
         self
     }
@@ -340,10 +351,9 @@ impl Worker {
     /// server reassigns the lease anyway, the handler task is aborted to avoid
     /// double processing.
     pub fn with_auto_extend(mut self) -> Self {
-        let lease = self.opts.lease_duration;
         self.auto_extend = Some(AutoExtend {
-            interval: heartbeat_interval(lease),
-            extend_by: lease,
+            explicit_interval: None,
+            extend_by: self.opts.lease_duration,
         });
         self
     }
@@ -352,10 +362,9 @@ impl Worker {
     /// heartbeat interval (floored at 1ms). The interval should be comfortably
     /// shorter than the lease duration.
     pub fn with_auto_extend_interval(mut self, interval: Duration) -> Self {
-        let lease = self.opts.lease_duration;
         self.auto_extend = Some(AutoExtend {
-            interval: interval.max(Duration::from_millis(1)),
-            extend_by: lease,
+            explicit_interval: Some(interval.max(Duration::from_millis(1))),
+            extend_by: self.opts.lease_duration,
         });
         self
     }
@@ -701,7 +710,12 @@ async fn dispose(
 
 async fn heartbeat(lease: Lease, cfg: AutoExtend, handler: AbortHandle) {
     loop {
-        tokio::time::sleep(cfg.interval).await;
+        // Derive from the granted lease; see AutoExtend::explicit_interval.
+        let interval = cfg.explicit_interval.unwrap_or_else(|| {
+            let remaining_ms = lease.known_expiry_ms().saturating_sub(now_millis()).max(0) as u64;
+            heartbeat_interval(Duration::from_millis(remaining_ms))
+        });
+        tokio::time::sleep(interval).await;
 
         match lease.extend(cfg.extend_by).await {
             Ok(expiry) => debug!(?expiry, "lease extended"),
