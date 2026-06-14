@@ -2,6 +2,7 @@
 name = "sepp-rs"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 include = ["src/**/*.rs", "proto/**/*.proto", "build.rs"]
 
 [dependencies]
