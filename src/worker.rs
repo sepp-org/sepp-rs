@@ -473,10 +473,11 @@ impl Worker {
             };
 
             let mut opts = self.opts.clone();
-            if let Some(user_max) = opts.max_jobs {
-                let capacity = (1 + semaphore.available_permits()).min(u32::MAX as usize) as u32;
-                opts.max_jobs = Some(user_max.min(capacity));
-            }
+            let capacity = (1 + semaphore.available_permits()).min(u32::MAX as usize) as u32;
+            opts.max_jobs = Some(match opts.max_jobs {
+                Some(user_max) => user_max.min(capacity),
+                None => capacity,
+            });
 
             let jobs = tokio::select! {
                 biased;
