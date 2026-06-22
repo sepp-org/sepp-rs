@@ -1,8 +1,4 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    unsafe {
-        std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
-    }
-
     // Proto files are vendored into `proto/` (committed to the repo, shipped in
     // the published crate). The version below is the one currently vendored; to
     // refresh, bump it to a newer published label/commit and re-run:
@@ -18,6 +14,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={proto}");
     }
 
+    use prost::Message;
+    let fds = protox::Compiler::new(includes)?
+        .include_imports(true)
+        .open_files(protos)?
+        .encode_file_descriptor_set();
+    let fds = prost_types::FileDescriptorSet::decode(fds.as_slice())?;
+
     let mut prost_config = prost_build::Config::new();
 
     prost_reflect_build::Builder::new()
@@ -27,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(false)
-        .compile_with_config(prost_config, protos, includes)?;
+        .compile_fds_with_config(fds, prost_config)?;
 
     Ok(())
 }

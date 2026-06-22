@@ -948,8 +948,8 @@ impl SeppClientBuilder {
             let mut endpoint = Endpoint::from_shared(addr.clone())?
                 .connect_timeout(Duration::from_secs(5))
                 .user_agent(concat!("sepp-rs/", env!("CARGO_PKG_VERSION")))? // So we can tell from the server POV which client this is
-                .http2_keep_alive_interval(Duration::from_secs(30)) // For streaming reserve
-                .keep_alive_timeout(Duration::from_secs(10)) // For streaming reserve
+                .http2_keep_alive_interval(Duration::from_secs(30)) // Long polling
+                .keep_alive_timeout(Duration::from_secs(10)) // Long polling
                 .keep_alive_while_idle(true); // For streaming reserve
             #[cfg(feature = "tls")]
             if let Some(tls) = tls {
