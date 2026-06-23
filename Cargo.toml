@@ -29,6 +29,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Only the `traced` example uses these (see [[example]] below). The exporter
 # deliberately lives in the host app, not the library.
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["grpc-tonic", "trace"] }
+testcontainers = "0.27"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["testing"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
