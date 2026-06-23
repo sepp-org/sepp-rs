@@ -2603,4 +2603,151 @@ mod tests {
         assert_eq!(req.job_type, "send_email");
         assert_eq!(req.priority, Some(3));
     }
+
+    #[test]
+    fn primitive_from_pb_string_value() {
+        let pb_value = pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::StringValue("hi".into())),
+        };
+        assert_eq!(
+            primitive_from_pb(pb_value),
+            Some(Primitive::String("hi".into()))
+        );
+    }
+
+    #[test]
+    fn primitive_from_pb_int_value() {
+        let pb_value = pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::IntValue(42)),
+        };
+        assert_eq!(primitive_from_pb(pb_value), Some(Primitive::Int(42)));
+    }
+
+    #[test]
+    fn primitive_from_pb_double_value() {
+        let pb_value = pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::DoubleValue(3.14)),
+        };
+        assert_eq!(primitive_from_pb(pb_value), Some(Primitive::Double(3.14)));
+    }
+
+    #[test]
+    fn primitive_from_pb_bool_value() {
+        let pb_value = pb::PrimitiveValue {
+            value: Some(pb::primitive_value::Value::BoolValue(true)),
+        };
+        assert_eq!(primitive_from_pb(pb_value), Some(Primitive::Bool(true)));
+    }
+
+    #[test]
+    fn primitive_from_pb_none_value() {
+        let pb_value = pb::PrimitiveValue { value: None };
+        assert_eq!(primitive_from_pb(pb_value), None);
+    }
+
+    #[test]
+    fn proto_duration_to_std_none_is_zero() {
+        assert_eq!(proto_duration_to_std(None), Duration::ZERO);
+    }
+
+    #[test]
+    fn proto_duration_to_std_positive() {
+        let d = proto_duration_to_std(Some(prost_types::Duration {
+            seconds: 3,
+            nanos: 500_000_000,
+        }));
+        assert_eq!(d, Duration::from_millis(3_500));
+    }
+
+    #[test]
+    fn proto_duration_to_std_negative_seconds_is_zero() {
+        let d = proto_duration_to_std(Some(prost_types::Duration {
+            seconds: -1,
+            nanos: 0,
+        }));
+        assert_eq!(d, Duration::ZERO);
+    }
+
+    #[test]
+    fn timestamp_to_system_time_zero_seconds_negative_nanos() {
+        assert!(timestamp_to_system_time(Some(ts(0, -1))).is_none());
+    }
+
+    #[test]
+    fn now_millis_is_reasonable() {
+        let now = now_millis();
+        assert!(
+            now > 1_577_836_800_000,
+            "now_millis too small: {now}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_ctx_display_contains_key_info() {
+        let client = test_client();
+        let job = job_from_pb(&client, valid_job_pb(), None).unwrap();
+        let display = format!("{}", job.ctx);
+        assert!(display.contains("send_email"));
+        assert!(display.contains("1/5"));
+        assert!(display.contains("priority: 3"));
+    }
+
+    #[test]
+    fn enqueue_request_with_custom_entry_multiple_types() {
+        let req = EnqueueRequest::new("q", "t")
+            .unwrap()
+            .with_custom_entry("str_key", "hello")
+            .with_custom_entry("int_key", 42_i64)
+            .with_custom_entry("bool_key", true);
+        let p: pb::EnqueueRequest = req.into();
+        assert_eq!(p.custom.len(), 3);
+        assert_eq!(
+            p.custom
+                .get("str_key")
+                .and_then(|v| v.value.as_ref()),
+            Some(&pb::primitive_value::Value::StringValue("hello".into()))
+        );
+        assert_eq!(
+            p.custom
+                .get("int_key")
+                .and_then(|v| v.value.as_ref()),
+            Some(&pb::primitive_value::Value::IntValue(42))
+        );
+        assert_eq!(
+            p.custom
+                .get("bool_key")
+                .and_then(|v| v.value.as_ref()),
+            Some(&pb::primitive_value::Value::BoolValue(true))
+        );
+    }
+
+    #[test]
+    fn reserve_opts_to_pb_minimal() {
+        let opts = ReserveOptions::new(["q"], Duration::from_secs(1)).unwrap();
+        let p: pb::ReserveRequest = opts.into();
+        assert_eq!(p.queues, vec!["q".to_string()]);
+        assert!(p.wait_timeout.is_some());
+        assert!(p.lease_duration.is_some());
+        assert!(p.worker_id.is_none());
+        assert!(p.max_jobs.is_none());
+    }
+
+    #[cfg(feature = "opentelemetry")]
+    mod opentelemetry_tests {
+        use super::*;
+
+        #[test]
+        fn otel_span_context_from_valid_traceparent() {
+            let tc = TraceContext::new(VALID_TP).unwrap();
+            assert!(tc.otel_span_context().is_some());
+        }
+
+        #[test]
+        fn otel_span_context_with_tracestate() {
+            let tc = TraceContext::new(VALID_TP)
+                .unwrap()
+                .with_tracestate("vendor=abc");
+            assert!(tc.otel_span_context().is_some());
+        }
+    }
 }

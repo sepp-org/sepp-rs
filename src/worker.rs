@@ -847,4 +847,195 @@ mod tests {
             .await
             .expect("cancelled() should be woken by shutdown signal");
     }
+
+    fn worker_test_client() -> SeppClient {
+        let chan = tonic::transport::Endpoint::from_static("http://[::1]:1").connect_lazy();
+        SeppClient::from_channel(chan)
+    }
+
+    async fn dummy_ok_handler(
+        _payload: Option<Payload>,
+        _ctx: Arc<JobCtx>,
+    ) -> Result<(), HandlerError> {
+        Ok(())
+    }
+
+    #[test]
+    fn default_worker_id_has_expected_format() {
+        let id = default_worker_id();
+        let parts: Vec<&str> = id.splitn(3, '-').collect();
+        assert!(
+            parts.len() >= 3,
+            "expected at least 3 dash-separated parts, got: {id}"
+        );
+        assert_eq!(
+            parts[2].len(),
+            8,
+            "expected 8-char hex suffix, got: {}",
+            parts[2]
+        );
+    }
+
+    #[test]
+    fn handler_error_display_retry() {
+        let e = HandlerError::retry("network timeout");
+        let s = e.to_string();
+        assert!(s.contains("retry"));
+        assert!(s.contains("network timeout"));
+    }
+
+    #[test]
+    fn handler_error_display_retry_after() {
+        let e = HandlerError::retry_after("rate limit", Duration::from_secs(30));
+        let s = e.to_string();
+        assert!(s.contains("retry after"));
+        assert!(s.contains("rate limit"));
+    }
+
+    #[test]
+    fn handler_error_display_permanent() {
+        let e = HandlerError::permanent("bad input");
+        let s = e.to_string();
+        assert!(s.contains("permanent"));
+        assert!(s.contains("bad input"));
+    }
+
+    #[test]
+    fn worker_builder_error_duplicate_handler_display() {
+        let e = WorkerBuilderError::DuplicateHandler("send_email".into());
+        let s = e.to_string();
+        assert!(s.contains("send_email"));
+        assert!(s.contains("already registered"));
+    }
+
+    #[test]
+    fn worker_builder_error_from_reserve_options() {
+        let e = WorkerBuilderError::from(ReserveOptionsError::EmptyWorkerId);
+        let s = e.to_string();
+        assert!(s.contains("worker_id"));
+    }
+
+    #[tokio::test]
+    async fn worker_new_rejects_empty_queues() {
+        let client = worker_test_client();
+        let result = Worker::new(client, Vec::<String>::new(), Duration::from_secs(1));
+        assert!(matches!(
+            result,
+            Err(WorkerBuilderError::ReserveOptions(ReserveOptionsError::EmptyQueues))
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_new_rejects_zero_lease() {
+        let client = worker_test_client();
+        let result = Worker::new(client, ["q"], Duration::ZERO);
+        assert!(matches!(
+            result,
+            Err(WorkerBuilderError::ReserveOptions(ReserveOptionsError::LeaseDurationTooShort))
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_new_succeeds_with_valid_args() {
+        let client = worker_test_client();
+        let _w = Worker::new(client, ["q"], Duration::from_secs(1)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_handle_rejects_duplicate_job_type() {
+        let client = worker_test_client();
+        let w = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .handle("my_job", dummy_ok_handler)
+            .unwrap();
+        let result = w.handle("my_job", dummy_ok_handler);
+        assert!(matches!(
+            result,
+            Err(WorkerBuilderError::DuplicateHandler(t)) if t == "my_job"
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_replace_handler_overwrites() {
+        let client = worker_test_client();
+        let _w = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .handle("my_job", dummy_ok_handler)
+            .unwrap()
+            .replace_handler("my_job", dummy_ok_handler);
+    }
+
+    #[tokio::test]
+    async fn worker_remove_handler_allows_re_registration() {
+        let client = worker_test_client();
+        let w = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .handle("my_job", dummy_ok_handler)
+            .unwrap()
+            .remove_handler("my_job");
+        let _w = w.handle("my_job", dummy_ok_handler).unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_with_catch_all_handler_succeeds() {
+        let client = worker_test_client();
+        let _w = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .with_catch_all_handler(dummy_ok_handler);
+    }
+
+    #[tokio::test]
+    async fn worker_with_worker_id_rejects_empty() {
+        let client = worker_test_client();
+        let result = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .with_worker_id("");
+        assert!(matches!(
+            result,
+            Err(WorkerBuilderError::ReserveOptions(ReserveOptionsError::EmptyWorkerId))
+        ));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "max_jobs must be at least 1")]
+    async fn worker_with_max_jobs_zero_panics() {
+        let client = worker_test_client();
+        let _w = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .with_max_jobs(0);
+    }
+
+    #[tokio::test]
+    async fn worker_with_max_jobs_valid() {
+        let client = worker_test_client();
+        let _w = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .with_max_jobs(5)
+            .handle("t", dummy_ok_handler)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_with_max_in_flight_lower_bound() {
+        let client = worker_test_client();
+        let _w = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .with_max_in_flight(1)
+            .handle("t", dummy_ok_handler)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_shutdown_handle_returns_untriggered_handle() {
+        let client = worker_test_client();
+        let w = Worker::new(client, ["q"], Duration::from_secs(1)).unwrap();
+        let h = w.shutdown_handle();
+        assert!(!h.is_shutdown());
+    }
+
+    #[test]
+    fn in_flight_guard_does_not_panic() {
+        let metrics = Arc::new(Metrics::new());
+        let _guard = InFlightGuard::new(metrics);
+    }
 }

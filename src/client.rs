@@ -1500,4 +1500,154 @@ mod tests {
         let request = client.unary_request(());
         assert!(request.metadata().contains_key("grpc-timeout"));
     }
+
+    #[test]
+    fn root_cause_returns_error_message() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "bottom");
+        assert_eq!(root_cause(&err), "bottom");
+    }
+
+    #[derive(Debug)]
+    struct ChainedErr {
+        msg: &'static str,
+        source: Option<Box<dyn std::error::Error + 'static>>,
+    }
+
+    impl std::fmt::Display for ChainedErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.msg)
+        }
+    }
+
+    impl std::error::Error for ChainedErr {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_deref()
+        }
+    }
+
+    #[test]
+    fn root_cause_walks_error_chain() {
+        let inner = ChainedErr {
+            msg: "deep cause",
+            source: None,
+        };
+        let outer = ChainedErr {
+            msg: "wrapper",
+            source: Some(Box::new(inner)),
+        };
+        assert_eq!(root_cause(&outer), "deep cause");
+    }
+
+    #[test]
+    fn retry_policy_with_max_attempts_clamps_to_one() {
+        let p = RetryPolicy::default().with_max_attempts(0);
+        assert_eq!(p.max_attempts(), 1);
+        let p = RetryPolicy::default().with_max_attempts(1);
+        assert_eq!(p.max_attempts(), 1);
+        let p = RetryPolicy::default().with_max_attempts(5);
+        assert_eq!(p.max_attempts(), 5);
+    }
+
+    #[test]
+    fn retry_policy_without_jitter_does_not_panic() {
+        let _p = RetryPolicy::default().without_jitter();
+    }
+
+    #[test]
+    fn retry_policy_multiplier_methods_do_not_panic() {
+        let _p = RetryPolicy::default().with_multiplier(0.5);
+        let _p = RetryPolicy::default().with_multiplier(1.0);
+        let _p = RetryPolicy::default().with_multiplier(2.5);
+    }
+
+    #[test]
+    fn enqueue_error_rejected_displays_job_rejection() {
+        let err = EnqueueError::Rejected(crate::JobRejection::Unknown);
+        let msg = err.to_string();
+        assert!(msg.contains("unrecognized rejection variant"));
+    }
+
+    #[test]
+    fn client_error_empty_batch_display() {
+        assert!(ClientError::EmptyBatch.to_string().contains("empty batch"));
+    }
+
+    #[test]
+    fn client_error_batch_result_count_mismatch_display() {
+        let err = ClientError::BatchResultCountMismatch {
+            expected: 10,
+            got: 7,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("10"));
+        assert!(msg.contains("7"));
+    }
+
+    #[test]
+    fn client_error_malformed_response_display() {
+        let err = ClientError::MalformedResponse("missing field id");
+        assert!(err.to_string().contains("missing field id"));
+    }
+
+    #[tokio::test]
+    async fn lease_new_and_known_expiry() {
+        let channel = Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let client = SeppClient::from_channel(channel);
+        let expiry = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let lease = Lease::new(client, "job-1".into(), 1, expiry, Some("worker-1".into()));
+        assert_eq!(lease.known_expiry_ms(), 100_000);
+    }
+
+    #[tokio::test]
+    async fn lease_known_expiry_ms_without_worker_id() {
+        let channel = Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let client = SeppClient::from_channel(channel);
+        let expiry = SystemTime::UNIX_EPOCH + Duration::from_millis(42);
+        let lease = Lease::new(client, "j".into(), 3, expiry, None);
+        assert_eq!(lease.known_expiry_ms(), 42);
+    }
+
+    #[tokio::test]
+    async fn lease_debug_format() {
+        let channel = Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let client = SeppClient::from_channel(channel);
+        let expiry = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let lease = Lease::new(client, "job-1".into(), 1, expiry, None);
+        let debug = format!("{:?}", lease);
+        assert!(debug.contains("job-1"));
+    }
+
+    #[cfg(feature = "tls")]
+    mod tls_tests {
+        use super::*;
+
+        #[test]
+        fn builder_tls_does_not_panic() {
+            let _b = SeppClient::builder("http://localhost:1").tls();
+        }
+
+        #[test]
+        fn builder_tls_chain_with_api_key() {
+            let _b = SeppClient::builder("http://localhost:1")
+                .api_key("secret")
+                .tls();
+        }
+
+        #[test]
+        fn builder_tls_domain_sets_domain() {
+            let _b = SeppClient::builder("http://localhost:1").tls_domain("example.com");
+        }
+
+        #[test]
+        fn builder_tls_ca_certificate_accepts_pem() {
+            let pem = b"-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----";
+            let _b = SeppClient::builder("http://localhost:1").tls_ca_certificate(pem.as_ref());
+        }
+
+        #[test]
+        fn builder_tls_config_accepts_default() {
+            let config = tonic::transport::ClientTlsConfig::default();
+            let _b = SeppClient::builder("http://localhost:1").tls_config(config);
+        }
+    }
 }
