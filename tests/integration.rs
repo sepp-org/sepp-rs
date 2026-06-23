@@ -535,6 +535,7 @@ async fn test_worker_with_auto_extend_keeps_lease_alive() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
+#[cfg(feature = "opentelemetry")]
 #[tokio::test]
 async fn test_otel_trace_context_from_active_span_roundtrips_through_server() {
     let _ = tracing_subscriber::fmt().try_init();
