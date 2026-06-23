@@ -921,7 +921,9 @@ mod tests {
         let result = Worker::new(client, Vec::<String>::new(), Duration::from_secs(1));
         assert!(matches!(
             result,
-            Err(WorkerBuilderError::ReserveOptions(ReserveOptionsError::EmptyQueues))
+            Err(WorkerBuilderError::ReserveOptions(
+                ReserveOptionsError::EmptyQueues
+            ))
         ));
     }
 
@@ -931,7 +933,9 @@ mod tests {
         let result = Worker::new(client, ["q"], Duration::ZERO);
         assert!(matches!(
             result,
-            Err(WorkerBuilderError::ReserveOptions(ReserveOptionsError::LeaseDurationTooShort))
+            Err(WorkerBuilderError::ReserveOptions(
+                ReserveOptionsError::LeaseDurationTooShort
+            ))
         ));
     }
 
@@ -992,7 +996,9 @@ mod tests {
             .with_worker_id("");
         assert!(matches!(
             result,
-            Err(WorkerBuilderError::ReserveOptions(ReserveOptionsError::EmptyWorkerId))
+            Err(WorkerBuilderError::ReserveOptions(
+                ReserveOptionsError::EmptyWorkerId
+            ))
         ));
     }
 

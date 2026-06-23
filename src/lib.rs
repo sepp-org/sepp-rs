@@ -2626,9 +2626,9 @@ mod tests {
     #[test]
     fn primitive_from_pb_double_value() {
         let pb_value = pb::PrimitiveValue {
-            value: Some(pb::primitive_value::Value::DoubleValue(3.14)),
+            value: Some(pb::primitive_value::Value::DoubleValue(2.5)),
         };
-        assert_eq!(primitive_from_pb(pb_value), Some(Primitive::Double(3.14)));
+        assert_eq!(primitive_from_pb(pb_value), Some(Primitive::Double(2.5)));
     }
 
     #[test]
@@ -2676,10 +2676,7 @@ mod tests {
     #[test]
     fn now_millis_is_reasonable() {
         let now = now_millis();
-        assert!(
-            now > 1_577_836_800_000,
-            "now_millis too small: {now}"
-        );
+        assert!(now > 1_577_836_800_000, "now_millis too small: {now}");
     }
 
     #[tokio::test]
@@ -2702,21 +2699,15 @@ mod tests {
         let p: pb::EnqueueRequest = req.into();
         assert_eq!(p.custom.len(), 3);
         assert_eq!(
-            p.custom
-                .get("str_key")
-                .and_then(|v| v.value.as_ref()),
+            p.custom.get("str_key").and_then(|v| v.value.as_ref()),
             Some(&pb::primitive_value::Value::StringValue("hello".into()))
         );
         assert_eq!(
-            p.custom
-                .get("int_key")
-                .and_then(|v| v.value.as_ref()),
+            p.custom.get("int_key").and_then(|v| v.value.as_ref()),
             Some(&pb::primitive_value::Value::IntValue(42))
         );
         assert_eq!(
-            p.custom
-                .get("bool_key")
-                .and_then(|v| v.value.as_ref()),
+            p.custom.get("bool_key").and_then(|v| v.value.as_ref()),
             Some(&pb::primitive_value::Value::BoolValue(true))
         );
     }

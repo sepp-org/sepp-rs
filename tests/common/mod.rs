@@ -1,5 +1,7 @@
 use std::time::Duration;
-use testcontainers::{core::IntoContainerPort, core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
+use testcontainers::{
+    GenericImage, ImageExt, core::IntoContainerPort, core::WaitFor, runners::AsyncRunner,
+};
 
 const SEPP_GRPC_PORT: u16 = 50051;
 

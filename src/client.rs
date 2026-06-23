@@ -1503,7 +1503,7 @@ mod tests {
 
     #[test]
     fn root_cause_returns_error_message() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "bottom");
+        let err = std::io::Error::other("bottom");
         assert_eq!(root_cause(&err), "bottom");
     }
 
