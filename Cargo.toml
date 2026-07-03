@@ -3,7 +3,13 @@ name = "sepp-rs"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-include = ["src/**/*.rs", "proto/**/*.proto", "build.rs"]
+description = "The official Rust client for sepp, a small, language-agnostic durable job queue"
+repository = "https://github.com/sepp-org/sepp-rs"
+documentation = "https://docs.rs/sepp-rs"
+readme = "README.md"
+keywords = ["sepp", "job-queue", "queue", "worker", "grpc"]
+categories = ["asynchronous", "network-programming"]
+include = ["src/**/*.rs", "proto/**/*.proto", "build.rs", "README.md", "LICENSE"]
 
 [dependencies]
 prost = "0.14"
