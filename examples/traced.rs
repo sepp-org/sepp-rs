@@ -16,9 +16,9 @@
 //!            -p 16686:16686 -p 4317:4317 -p 4318:4318 \
 //!            jaegertracing/jaeger:latest
 //!
-//! Run it:
+//! Run it (the `opentelemetry` feature is on by default):
 //!
-//!     cargo run --example traced --features opentelemetry
+//!     cargo run --example traced
 //!
 //! Then open your tracing backend, pick the `sepp-rs-example` service, and open
 //! the most recent `sepp-rs.process` trace. That span carries a *link* back to
@@ -100,10 +100,8 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Enqueue a job. `enqueue` -> `enqueue_batch` opens the `sepp-rs.enqueue`
     //    span and stamps its trace context onto the job.
-    let job = EnqueueRequest::new(QUEUE, JOB_TYPE)?.with_payload(Payload {
-        data: b"hello, sepp".to_vec(),
-        encoding: "text/plain".to_string(),
-    });
+    let job = EnqueueRequest::new(QUEUE, JOB_TYPE)?
+        .with_payload(Payload::new(b"hello, sepp".to_vec(), "text/plain"));
     let ack = client.enqueue(job).await?;
     println!("enqueued job {}", ack.job_id);
 
@@ -126,12 +124,16 @@ async fn roundtrip() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     )?;
+    // Take the shutdown handle before `run()` consumes the worker.
+    let shutdown = worker.shutdown_handle();
     let worker_task = tokio::spawn(worker.run());
 
-    // 3. Wait for the job to be processed, then tear the worker down.
+    // 3. Wait for the job to be processed, then drain the worker: after
+    //    `shutdown()` it stops reserving, finishes (and acks) in-flight jobs,
+    //    and `run()` returns.
     let processed = tokio::time::timeout(Duration::from_secs(15), done_rx.recv()).await;
-    tokio::time::sleep(Duration::from_millis(500)).await; // let the worker ack
-    worker_task.abort();
+    shutdown.shutdown();
+    worker_task.await?;
 
     match processed {
         Ok(Some(id)) => {

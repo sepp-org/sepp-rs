@@ -63,7 +63,9 @@ const _: fn() = || {
 /// gRPC status codes are mapped onto these variants: `Unavailable` /
 /// `DeadlineExceeded` / `Aborted` / `Cancelled` become [`Transport`](Self::Transport),
 /// `ResourceExhausted` becomes [`Overloaded`](Self::Overloaded), and so on. The
-/// transport-ish variants are the ones the [`RetryPolicy`] retries.
+/// [`RetryPolicy`] retries `Unavailable`, `DeadlineExceeded`, and `Aborted`
+/// (all surfacing as `Transport`) plus `ResourceExhausted` (`Overloaded`);
+/// a `Cancelled` RPC also maps to `Transport` but is never retried.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ClientError {
@@ -74,7 +76,9 @@ pub enum ClientError {
     #[error("the API key is not a valid HTTP header value")]
     InvalidApiKey,
     /// A transient transport-level failure (connection dropped, deadline
-    /// exceeded, request aborted/cancelled). Generally safe to retry.
+    /// exceeded, request aborted/cancelled). Generally safe to retry, though
+    /// the [`RetryPolicy`] does not retry cancelled RPCs, and retried enqueues
+    /// can duplicate jobs that carry no idempotency key.
     #[error("transport failure: {0}")]
     Transport(String),
     /// The server rejected the credentials (missing/invalid API key, or
@@ -225,13 +229,25 @@ pub enum RetryDirective {
     DeadLetter,
 }
 
-/// Backoff policy for retrying *transient* RPC failures (those mapped to
-/// [`ClientError::Transport`] / [`Overloaded`](ClientError::Overloaded)).
+/// Backoff policy for retrying *transient* RPC failures (`Unavailable`,
+/// `DeadlineExceeded`, and `Aborted`, which map to [`ClientError::Transport`],
+/// plus `ResourceExhausted`, which maps to
+/// [`Overloaded`](ClientError::Overloaded); a `Cancelled` RPC also maps to
+/// `Transport` but is not retried).
 ///
 /// Applies to enqueue, ack, nack, extend, and get-server-info — but not to
 /// [`reserve`](SeppClient::reserve), which is a long poll. The default policy
 /// performs **no** retries (`max_attempts == 1`); opt in by building one up and
 /// passing it to [`SeppClientBuilder::retry_policy`].
+///
+/// Retried enqueues can duplicate jobs that carry no idempotency key. To limit
+/// that hazard, an enqueue request in which any job lacks an
+/// [idempotency key](crate::EnqueueRequest::with_idempotency_key) is not
+/// retried on the ambiguous-commit codes `DeadlineExceeded` and `Aborted` —
+/// the server may have already committed the batch — while `Unavailable` and
+/// `ResourceExhausted` (the request was rejected or never ran) stay retryable.
+/// When every job in the request carries an idempotency key, the server
+/// dedupes replays and the full transient set is retried.
 ///
 /// ```
 /// use std::time::Duration;
@@ -355,7 +371,10 @@ impl SeppClient {
     /// is `Ok` for an accepted job or `Err` for a per-job [`JobRejection`]. The
     /// outer `Err` is reserved for whole-call failures (empty batch, transport
     /// error, protocol violation). Transient failures are retried per the
-    /// client's [`RetryPolicy`].
+    /// client's [`RetryPolicy`]; note that retried enqueues can duplicate jobs
+    /// that carry no idempotency key, so when any job in the batch lacks one,
+    /// the ambiguous-commit codes `DeadlineExceeded` and `Aborted` are not
+    /// retried (see [`RetryPolicy`]).
     ///
     /// For all-or-nothing semantics, use [`enqueue_atomic`](Self::enqueue_atomic).
     pub async fn enqueue_batch(
@@ -369,7 +388,9 @@ impl SeppClient {
         let sent = jobs.len();
         tracing::Span::current().record("jobs", sent);
 
-        let response = with_retry(&self.retry_policy, "enqueue_batch", || {
+        let all_keyed = all_jobs_keyed(&jobs);
+        let retryable = |status: &Status| is_transient_enqueue(status, all_keyed);
+        let response = with_retry_if(&self.retry_policy, "enqueue_batch", retryable, || {
             let mut request = self.unary_request(pb::EnqueueBatchRequest { jobs: jobs.clone() });
             inject_trace_context(&mut request);
             let mut inner = self.inner.clone();
@@ -411,7 +432,9 @@ impl SeppClient {
     ///
     /// A convenience wrapper over [`enqueue_batch`](Self::enqueue_batch) that
     /// flattens the result: a per-job rejection becomes
-    /// [`EnqueueError::Rejected`].
+    /// [`EnqueueError::Rejected`]. Its retry behavior — including that a
+    /// retried enqueue can duplicate a job that carries no idempotency key —
+    /// is inherited from [`enqueue_batch`](Self::enqueue_batch).
     pub async fn enqueue(&self, job: EnqueueRequest) -> Result<EnqueueAck, EnqueueError> {
         let mut results = self.enqueue_batch(std::iter::once(job)).await?.into_iter();
 
@@ -436,6 +459,11 @@ impl SeppClient {
     /// together as [`AtomicEnqueueError::Validation`](crate::AtomicEnqueueError::Validation).
     /// Use this when the jobs are coordinated steps and a partial enqueue would
     /// leave the system inconsistent.
+    ///
+    /// Transient failures are retried per the client's [`RetryPolicy`]; note
+    /// that retried enqueues can duplicate jobs that carry no idempotency key,
+    /// so when any job in the batch lacks one, the ambiguous-commit codes
+    /// `DeadlineExceeded` and `Aborted` are not retried (see [`RetryPolicy`]).
     pub async fn enqueue_atomic(
         &self,
         jobs: impl IntoIterator<Item = EnqueueRequest>,
@@ -447,7 +475,9 @@ impl SeppClient {
         let sent = jobs.len();
         tracing::Span::current().record("jobs", sent);
 
-        let response = with_retry(&self.retry_policy, "enqueue_atomic", || {
+        let all_keyed = all_jobs_keyed(&jobs);
+        let retryable = |status: &Status| is_transient_enqueue(status, all_keyed);
+        let response = with_retry_if(&self.retry_policy, "enqueue_atomic", retryable, || {
             let mut request = self.unary_request(pb::EnqueueBatchRequest { jobs: jobs.clone() });
             inject_trace_context(&mut request);
             let mut inner = self.inner.clone();
@@ -582,31 +612,18 @@ impl SeppClient {
     /// Negatively acknowledges a job, signalling that processing failed.
     ///
     /// `retry` selects what the server does next (see [`RetryDirective`]) and
-    /// `reason` is recorded for debugging and metrics. Returns `true` if this
-    /// nack moved the job to the dead-letter queue (because `DeadLetter` was
-    /// requested or `max_attempts` was reached), `false` if it will be retried.
+    /// `reason` is recorded for debugging and metrics; an empty `reason` is
+    /// omitted from the request rather than sent as an empty string. Returns
+    /// `true` if this nack moved the job to the dead-letter queue (because
+    /// `DeadLetter` was requested or `max_attempts` was reached), `false` if
+    /// it will be retried.
     pub async fn nack(
         &self,
         ctx: &JobCtx,
         retry: RetryDirective,
         reason: impl Into<String>,
     ) -> Result<bool, LeaseError> {
-        let strategy = match retry {
-            RetryDirective::Default => pb::nack_retry::Strategy::Default(()),
-            RetryDirective::After(d) => {
-                pb::nack_retry::Strategy::Delay(crate::duration_to_proto(d))
-            }
-            RetryDirective::DeadLetter => pb::nack_retry::Strategy::DeadLetter(()),
-        };
-        let body = pb::NackRequest {
-            job_id: ctx.id.clone(),
-            attempt: ctx.attempt,
-            reason: Some(reason.into()),
-            retry: Some(pb::NackRetry {
-                strategy: Some(strategy),
-            }),
-            worker_id: ctx.lease.worker_id.clone(),
-        };
+        let body = nack_request(ctx, retry, reason.into());
 
         let response = with_retry(&self.retry_policy, "nack", || {
             let request = self.unary_request(body.clone());
@@ -707,7 +724,8 @@ impl SeppClient {
     /// Drains dead-lettered jobs for inspection and manual replay.
     ///
     /// Returns up to `max` [`DeadLetterRecord`]s (oldest-first, optionally
-    /// filtered to one `queue`) and **removes them from the server**. This is
+    /// filtered to one `queue`) and **removes them from the server**; a `max`
+    /// of `0` returns an empty vector without making an RPC. This is
     /// destructive: the records are gone once returned, so a dropped response
     /// loses exactly that batch — for that reason it is **not** retried by the
     /// [`RetryPolicy`]. Inspect each record, then replay any you want with
@@ -721,9 +739,14 @@ impl SeppClient {
         queue: Option<&str>,
         max: u32,
     ) -> Result<Vec<DeadLetterRecord>, ClientError> {
+        if max == 0 {
+            // The server rejects max = 0; draining a record the caller asked
+            // zero of would be silent data loss.
+            return Ok(Vec::new());
+        }
         let request = self.unary_request(pb::DrainDeadLettersRequest {
             queue: queue.map(String::from),
-            max: Some(max.max(1)),
+            max: Some(max),
         });
 
         let response = match self.inner.clone().drain_dead_letters(request).await {
@@ -864,6 +887,9 @@ impl SeppClientBuilder {
     /// [`reserve`](SeppClient::reserve), whose deadline follows the requested
     /// wait timeout instead. Defaults to 30 seconds.
     ///
+    /// The deadline travels as the `grpc-timeout` request header and is
+    /// enforced by the server, not by a client-side timer.
+    ///
     /// Enqueuing very large batches may need a higher value.
     pub fn rpc_timeout(mut self, timeout: Duration) -> Self {
         self.rpc_timeout = timeout;
@@ -947,10 +973,12 @@ impl SeppClientBuilder {
             #[allow(unused_mut)]
             let mut endpoint = Endpoint::from_shared(addr.clone())?
                 .connect_timeout(Duration::from_secs(5))
-                .user_agent(concat!("sepp-rs/", env!("CARGO_PKG_VERSION")))? // So we can tell from the server POV which client this is
-                .http2_keep_alive_interval(Duration::from_secs(30)) // Long polling
-                .keep_alive_timeout(Duration::from_secs(10)) // Long polling
-                .keep_alive_while_idle(true); // For streaming reserve
+                .user_agent(concat!("sepp-rs/", env!("CARGO_PKG_VERSION")))?
+                // Keepalives so a connection idling in a long-poll reserve is
+                // not dropped as dead.
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .keep_alive_timeout(Duration::from_secs(10))
+                .keep_alive_while_idle(true);
             #[cfg(feature = "tls")]
             if let Some(tls) = tls {
                 endpoint = endpoint.tls_config(tls)?;
@@ -1044,6 +1072,49 @@ fn is_transient(status: &Status) -> bool {
     )
 }
 
+/// Returns whether a gRPC status is worth retrying for an *enqueue* RPC.
+///
+/// When every job in the request carries an idempotency key the server dedupes
+/// replays, so the full transient set is safe. Otherwise `DeadlineExceeded`
+/// and `Aborted` are excluded: they are ambiguous-commit failures — the server
+/// may have already committed the batch, and a retry would duplicate every job
+/// without a key. `Unavailable` and `ResourceExhausted` mean the request was
+/// rejected or never ran, so they stay retryable either way.
+fn is_transient_enqueue(status: &Status, all_jobs_keyed: bool) -> bool {
+    use tonic::Code;
+    if all_jobs_keyed {
+        return is_transient(status);
+    }
+    matches!(status.code(), Code::Unavailable | Code::ResourceExhausted)
+}
+
+/// Returns whether every job in the batch carries a non-empty idempotency key
+/// (the server rejects present-but-empty keys, so those count as unkeyed).
+fn all_jobs_keyed(jobs: &[pb::EnqueueRequest]) -> bool {
+    jobs.iter()
+        .all(|j| j.idempotency_key.as_deref().is_some_and(|k| !k.is_empty()))
+}
+
+/// Builds the wire request for a nack.
+fn nack_request(ctx: &JobCtx, retry: RetryDirective, reason: String) -> pb::NackRequest {
+    let strategy = match retry {
+        RetryDirective::Default => pb::nack_retry::Strategy::Default(()),
+        RetryDirective::After(d) => pb::nack_retry::Strategy::Delay(crate::duration_to_proto(d)),
+        RetryDirective::DeadLetter => pb::nack_retry::Strategy::DeadLetter(()),
+    };
+    pb::NackRequest {
+        job_id: ctx.id.clone(),
+        attempt: ctx.attempt,
+        // The reason is optional on the wire: omit it entirely when the caller
+        // has none rather than sending a present-but-empty string.
+        reason: (!reason.is_empty()).then_some(reason),
+        retry: Some(pb::NackRetry {
+            strategy: Some(strategy),
+        }),
+        worker_id: ctx.lease.worker_id.clone(),
+    }
+}
+
 /// Equal-jitter factor: returns a value in `[0.5, 1.0)`.
 fn jitter_factor() -> f64 {
     let nanos = SystemTime::now()
@@ -1062,18 +1133,34 @@ fn jitter_factor() -> f64 {
 async fn with_retry<F, Fut, T>(
     policy: &RetryPolicy,
     operation: &'static str,
+    f: F,
+) -> Result<T, Status>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Status>>,
+{
+    with_retry_if(policy, operation, is_transient, f).await
+}
+
+/// Like [`with_retry`], but with a custom `retryable` predicate. Enqueue RPCs
+/// use this to narrow the retry set when jobs lack idempotency keys.
+async fn with_retry_if<F, Fut, T, P>(
+    policy: &RetryPolicy,
+    operation: &'static str,
+    retryable: P,
     mut f: F,
 ) -> Result<T, Status>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, Status>>,
+    P: Fn(&Status) -> bool,
 {
     let mut attempt: u32 = 1;
     let mut backoff = policy.initial_backoff;
     loop {
         match f().await {
             Ok(v) => return Ok(v),
-            Err(status) if attempt >= policy.max_attempts || !is_transient(&status) => {
+            Err(status) if attempt >= policy.max_attempts || !retryable(&status) => {
                 tracing::Span::current().record("otel.status_code", "error");
                 return Err(status);
             }
@@ -1358,6 +1445,98 @@ mod tests {
     }
 
     #[test]
+    fn is_transient_enqueue_all_keyed_matches_is_transient() {
+        for code in [
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+            Code::Aborted,
+            Code::ResourceExhausted,
+        ] {
+            assert!(is_transient_enqueue(&st(code, ""), true));
+        }
+        assert!(!is_transient_enqueue(&st(Code::Cancelled, ""), true));
+        assert!(!is_transient_enqueue(&st(Code::Internal, ""), true));
+    }
+
+    #[test]
+    fn is_transient_enqueue_unkeyed_excludes_ambiguous_commit_codes() {
+        // The server may have committed the batch on these; a retry would
+        // duplicate jobs that carry no idempotency key.
+        assert!(!is_transient_enqueue(
+            &st(Code::DeadlineExceeded, ""),
+            false
+        ));
+        assert!(!is_transient_enqueue(&st(Code::Aborted, ""), false));
+
+        // These mean the request was rejected or never ran.
+        assert!(is_transient_enqueue(&st(Code::Unavailable, ""), false));
+        assert!(is_transient_enqueue(
+            &st(Code::ResourceExhausted, ""),
+            false
+        ));
+    }
+
+    fn keyed_job(key: Option<&str>) -> pb::EnqueueRequest {
+        pb::EnqueueRequest {
+            idempotency_key: key.map(String::from),
+            ..crate::EnqueueRequest::new("q", "t").unwrap().into()
+        }
+    }
+
+    #[test]
+    fn all_jobs_keyed_requires_a_non_empty_key_on_every_job() {
+        assert!(all_jobs_keyed(&[
+            keyed_job(Some("a")),
+            keyed_job(Some("b"))
+        ]));
+        assert!(!all_jobs_keyed(&[keyed_job(Some("a")), keyed_job(None)]));
+        // The server rejects present-but-empty keys, so they count as unkeyed.
+        assert!(!all_jobs_keyed(&[keyed_job(Some(""))]));
+    }
+
+    /// Runs `with_retry_if` under the enqueue predicate, counting attempts.
+    async fn run_enqueue_retry(all_keyed: bool, code: Code) -> u32 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let result: Result<(), Status> = with_retry_if(
+            &fast_policy(3),
+            "test",
+            |status| is_transient_enqueue(status, all_keyed),
+            move || {
+                let calls = calls2.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(st(code, "boom"))
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        calls.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn keyless_enqueue_deadline_exceeded_is_not_retried() {
+        assert_eq!(run_enqueue_retry(false, Code::DeadlineExceeded).await, 1);
+    }
+
+    #[tokio::test]
+    async fn keyless_enqueue_aborted_is_not_retried() {
+        assert_eq!(run_enqueue_retry(false, Code::Aborted).await, 1);
+    }
+
+    #[tokio::test]
+    async fn keyed_enqueue_deadline_exceeded_is_retried() {
+        assert_eq!(run_enqueue_retry(true, Code::DeadlineExceeded).await, 3);
+    }
+
+    #[tokio::test]
+    async fn keyless_enqueue_unavailable_is_retried() {
+        assert_eq!(run_enqueue_retry(false, Code::Unavailable).await, 3);
+    }
+
+    #[test]
     fn jitter_factor_in_range() {
         for _ in 0..256 {
             let f = jitter_factor();
@@ -1587,6 +1766,80 @@ mod tests {
     fn client_error_malformed_response_display() {
         let err = ClientError::MalformedResponse("missing field id");
         assert!(err.to_string().contains("missing field id"));
+    }
+
+    #[tokio::test]
+    async fn drain_dead_letters_zero_max_returns_empty_without_rpc() {
+        // The endpoint is unreachable, so any attempted RPC would fail: an Ok
+        // result proves max = 0 short-circuits before hitting the wire.
+        let channel = Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let client = SeppClient::from_channel(channel);
+        let records = client.drain_dead_letters(None, 0).await.unwrap();
+        assert!(records.is_empty());
+    }
+
+    fn test_job_ctx() -> crate::JobCtx {
+        let channel = Endpoint::from_static("http://[::1]:1").connect_lazy();
+        let client = SeppClient::from_channel(channel);
+        let job = pb::Job {
+            id: "job-1".into(),
+            job_type: "t".into(),
+            payload: None,
+            priority: 0,
+            trace_context: None,
+            enqueued_at: Some(prost_types::Timestamp {
+                seconds: 1,
+                nanos: 0,
+            }),
+            attempt: 2,
+            max_attempts: 5,
+            lease_expires_at: Some(prost_types::Timestamp {
+                seconds: 2,
+                nanos: 0,
+            }),
+            custom: Default::default(),
+            scheduled_at: None,
+            queue: "q".into(),
+        };
+        crate::job_from_pb(&client, job, Some("w1")).unwrap().ctx
+    }
+
+    #[tokio::test]
+    async fn nack_request_omits_empty_reason() {
+        let ctx = test_job_ctx();
+        let body = nack_request(&ctx, RetryDirective::Default, String::new());
+        assert_eq!(body.reason, None);
+    }
+
+    #[tokio::test]
+    async fn nack_request_carries_fields_and_reason() {
+        let ctx = test_job_ctx();
+        let body = nack_request(
+            &ctx,
+            RetryDirective::After(Duration::from_secs(3)),
+            "boom".into(),
+        );
+        assert_eq!(body.job_id, "job-1");
+        assert_eq!(body.attempt, 2);
+        assert_eq!(body.worker_id.as_deref(), Some("w1"));
+        assert_eq!(body.reason.as_deref(), Some("boom"));
+        assert_eq!(
+            body.retry.unwrap().strategy,
+            Some(pb::nack_retry::Strategy::Delay(prost_types::Duration {
+                seconds: 3,
+                nanos: 0
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn nack_request_dead_letter_strategy() {
+        let ctx = test_job_ctx();
+        let body = nack_request(&ctx, RetryDirective::DeadLetter, "bad".into());
+        assert_eq!(
+            body.retry.unwrap().strategy,
+            Some(pb::nack_retry::Strategy::DeadLetter(()))
+        );
     }
 
     #[tokio::test]

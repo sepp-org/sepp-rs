@@ -34,16 +34,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let client = SeppClient::connect(addr).await?;
 
     // 1. Enqueue a single job.
-    let job = EnqueueRequest::new(QUEUE, JOB_TYPE)?.with_payload(Payload {
-        data: b"hello, sepp".to_vec(),
-        encoding: "text/plain".to_string(),
-    });
+    let job = EnqueueRequest::new(QUEUE, JOB_TYPE)?
+        .with_payload(Payload::new(b"hello, sepp".to_vec(), "text/plain"));
 
     let ack = client.enqueue(job).await?;
-    println!(
-        "enqueued job {} (deduplicated={})",
-        ack.job_id, ack.deduplicated
-    );
+    println!("enqueued job {}", ack.job_id);
 
     // 2. Launch a worker. The handler sends the job id back over a channel so
     //    the example can finish instead of looping in `run` forever.
@@ -64,27 +59,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
+    // Take the shutdown handle before `run()` consumes the worker.
+    let shutdown = worker.shutdown_handle();
     let worker_task = tokio::spawn(worker.run());
+
+    // Shut down cleanly on ctrl-c too.
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                shutdown.shutdown();
+            }
+        });
+    }
 
     // 3. Wait for the job to be processed, with a timeout.
     let processed = tokio::time::timeout(Duration::from_secs(15), done_rx.recv()).await;
 
+    // 4. Drain the worker: after `shutdown()` it stops reserving, finishes
+    //    (and acks) in-flight jobs, and `run()` returns — so the job is not
+    //    redelivered on the next run.
+    shutdown.shutdown();
+    worker_task.await?;
+
     match processed {
         Ok(Some(id)) => {
-            // Give the worker a moment to ack before tearing it down, so the
-            // job is not redelivered on the next run.
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            worker_task.abort();
             println!("roundtrip OK — job {id} was enqueued and processed");
             Ok(())
         }
-        Ok(None) => {
-            worker_task.abort();
-            Err("worker stopped before processing the job".into())
-        }
-        Err(_) => {
-            worker_task.abort();
-            Err("timed out waiting for the job to be processed".into())
-        }
+        Ok(None) => Err("worker stopped before processing the job".into()),
+        Err(_) => Err("timed out waiting for the job to be processed".into()),
     }
 }

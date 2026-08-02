@@ -48,6 +48,13 @@ use crate::{
     now_millis,
 };
 
+/// An empty reserve that returns sooner than this did not wait out its long
+/// poll (e.g. the server is draining at shutdown); re-polling immediately
+/// would hammer it.
+const EARLY_EMPTY_THRESHOLD: Duration = Duration::from_millis(100);
+/// How long to pause before re-polling after such an early empty reserve.
+const EARLY_EMPTY_BACKOFF: Duration = Duration::from_millis(250);
+
 type Handler = Arc<
     dyn Fn(Option<Payload>, Arc<JobCtx>) -> BoxFuture<'static, Result<(), HandlerError>>
         + Send
@@ -124,7 +131,10 @@ pub enum WorkerBuilderError {
 ///
 /// Each reserved job runs on its own task, bounded by
 /// [`with_max_in_flight`](Self::with_max_in_flight). A job whose `job_type` has
-/// no registered handler is nacked for retry.
+/// no registered handler is nacked for retry with an attempt-based backoff
+/// (`min(2^attempt, 60)` seconds), so a worker that does have the handler —
+/// e.g. one running the next deploy — can pick it up instead of this worker
+/// burning through the job's attempts.
 pub struct Worker {
     client: SeppClient,
     opts: ReserveOptions,
@@ -317,7 +327,13 @@ impl Worker {
 
     /// Sets the long-poll wait timeout for each reserve. See
     /// [`ReserveOptions::with_wait_timeout`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `wait` is zero. The server would answer every reserve
+    /// immediately, turning the poll loop into back-to-back RPCs.
     pub fn with_wait_timeout(mut self, wait: Duration) -> Self {
+        assert!(!wait.is_zero(), "wait_timeout must be non-zero");
         self.opts.wait_timeout = wait;
         self
     }
@@ -436,7 +452,7 @@ impl Worker {
     }
 
     /// Unregisters the handler for a `job_type`, if any. Jobs of an unhandled
-    /// type are nacked for retry.
+    /// type are nacked for retry with an attempt-based backoff.
     pub fn remove_handler(mut self, job_type: &str) -> Self {
         self.handlers.remove(job_type);
         self
@@ -445,11 +461,20 @@ impl Worker {
     /// Runs the reserve → process → ack/nack loop until shutdown.
     ///
     /// Consumes the worker and does not return until a [`ShutdownHandle`] is
-    /// triggered *and* all in-flight jobs have finished draining. Reserve
-    /// errors are logged and retried after
+    /// triggered *and* all in-flight jobs have finished draining. Shutdown
+    /// cancels a still-pending reserve promptly, but a reserve that has already
+    /// completed with jobs at the shutdown boundary still has those jobs
+    /// processed as part of the drain — they are leased to this worker either
+    /// way. Reserve errors are logged and retried after
     /// [`with_reserve_error_backoff`](Self::with_reserve_error_backoff); they do
     /// not stop the loop. Take a [`shutdown_handle`](Self::shutdown_handle)
     /// beforehand to be able to stop it.
+    ///
+    /// The drain wait is unbounded: a handler that never returns blocks the
+    /// return of `run` indefinitely (and with
+    /// [`with_auto_extend`](Self::with_auto_extend) its lease is kept alive the
+    /// whole time). If a handler's work can hang, bound it yourself, e.g. with
+    /// [`tokio::time::timeout`].
     pub async fn run(self) {
         let max_permits = self.max_in_flight.max(1);
         let semaphore = Arc::new(Semaphore::new(max_permits));
@@ -479,12 +504,14 @@ impl Worker {
                 None => capacity,
             });
 
+            // Biased with the reserve arm first: when shutdown lands just as a
+            // reserve completes with jobs in hand, those jobs are already
+            // leased to this worker, so process them as part of the drain
+            // instead of leaving them invisible until the lease expires. A
+            // still-pending reserve is dropped (cancelled) promptly.
+            let reserve_started = tokio::time::Instant::now();
             let jobs = tokio::select! {
                 biased;
-                () = shutdown.token.cancelled() => {
-                    drop(permit);
-                    break 'outer;
-                }
                 res = self.client.reserve(&opts) => match res {
                     Ok(Some(jobs)) => {
                         metrics.record_reserve_ok(false);
@@ -492,7 +519,22 @@ impl Worker {
                     }
                     Ok(None) => {
                         metrics.record_reserve_ok(true);
-                        continue; // wait window elapsed — re-poll immediately
+                        // Wait window elapsed — normally re-poll immediately.
+                        // But an empty response that arrives much sooner than
+                        // the requested wait (e.g. a server draining at
+                        // shutdown answers at once) would hot-loop, so pause
+                        // briefly first. Capped at half the wait window so a
+                        // deliberately tiny wait_timeout is not misread as
+                        // early.
+                        if reserve_started.elapsed() < EARLY_EMPTY_THRESHOLD.min(opts.wait_timeout / 2) {
+                            drop(permit);
+                            tokio::select! {
+                                biased;
+                                () = shutdown.token.cancelled() => break 'outer,
+                                () = tokio::time::sleep(EARLY_EMPTY_BACKOFF) => {},
+                            }
+                        }
+                        continue;
                     }
                     Err(_err) => {
                         metrics.record_reserve_failed();
@@ -508,6 +550,10 @@ impl Worker {
                         }
                     }
                 },
+                () = shutdown.token.cancelled() => {
+                    drop(permit);
+                    break 'outer;
+                }
             };
 
             let mut jobs = jobs.into_iter();
@@ -624,13 +670,19 @@ async fn run_job(
     let Some(handler) = handlers.get(&ctx.job_type).or(catch_all_handler.as_ref()) else {
         warn!("no handler registered for job_type `{}`", ctx.job_type);
 
-        let _ = client
+        // Nack with a backoff rather than the default (immediate) retry:
+        // otherwise this worker re-reserves the job right away and burns
+        // through its attempts in milliseconds.
+        if let Err(err) = client
             .nack(
                 &ctx,
-                RetryDirective::Default,
+                RetryDirective::After(nack_backoff(ctx.attempt)),
                 "no handler registered for job_type",
             )
-            .await;
+            .await
+        {
+            warn!("failed to nack job with no registered handler: {err}");
+        }
         return;
     };
 
@@ -700,13 +752,25 @@ async fn dispose(
         Disposition::Panicked => {
             tracing::Span::current().record("otel.status_code", "error");
             error!("handler panicked; nacking");
+            // Backoff instead of an immediate retry, so a deterministically
+            // panicking handler cannot hot-loop through the job's attempts.
             let dead_lettered = client
-                .nack(ctx, RetryDirective::Default, "handler panicked")
+                .nack(
+                    ctx,
+                    RetryDirective::After(nack_backoff(ctx.attempt)),
+                    "handler panicked",
+                )
                 .await?;
             metrics.record_nacked(dead_lettered);
             Ok(())
         }
     }
+}
+
+/// Exponential backoff for the worker's own nacks (no registered handler,
+/// panicked handler): `min(2^attempt, 60)` seconds, with `attempt` 1-based.
+fn nack_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(2u64.saturating_pow(attempt).min(60))
 }
 
 async fn heartbeat(lease: Lease, cfg: AutoExtend, handler: AbortHandle) {
@@ -744,11 +808,20 @@ fn heartbeat_interval(lease: Duration) -> Duration {
 }
 
 fn default_worker_id() -> String {
-    let host = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
+    let host = hostname();
     let rand = uuid::Uuid::new_v4().simple().to_string();
     format!("{host}-{}-{}", std::process::id(), &rand[..8])
+}
+
+/// Resolves the machine's hostname: the `HOSTNAME` / `COMPUTERNAME` env vars
+/// when set (containers export `HOSTNAME`; most other environments do not),
+/// otherwise the OS hostname.
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -862,18 +935,39 @@ mod tests {
 
     #[test]
     fn default_worker_id_has_expected_format() {
+        // host-pid-rand8, where the hostname itself may contain dashes:
+        // parse from the right.
         let id = default_worker_id();
-        let parts: Vec<&str> = id.splitn(3, '-').collect();
-        assert!(
-            parts.len() >= 3,
-            "expected at least 3 dash-separated parts, got: {id}"
-        );
+        let parts: Vec<&str> = id.rsplitn(3, '-').collect();
         assert_eq!(
-            parts[2].len(),
-            8,
-            "expected 8-char hex suffix, got: {}",
-            parts[2]
+            parts.len(),
+            3,
+            "expected host-pid-rand dash-separated parts, got: {id}"
         );
+        assert_eq!(parts[0].len(), 8, "expected 8-char hex suffix, got: {id}");
+        assert_eq!(
+            parts[1].parse::<u32>().ok(),
+            Some(std::process::id()),
+            "expected the middle part to be the PID, got: {id}"
+        );
+        assert!(!parts[2].is_empty(), "expected a hostname part, got: {id}");
+    }
+
+    #[test]
+    fn hostname_resolves_outside_containers() {
+        // HOSTNAME is a shell-local variable and is typically NOT exported to
+        // this process, so this exercises the OS fallback on most machines.
+        assert!(!hostname().is_empty());
+    }
+
+    #[test]
+    fn nack_backoff_grows_exponentially_and_caps_at_sixty_seconds() {
+        assert_eq!(nack_backoff(1), Duration::from_secs(2));
+        assert_eq!(nack_backoff(2), Duration::from_secs(4));
+        assert_eq!(nack_backoff(5), Duration::from_secs(32));
+        assert_eq!(nack_backoff(6), Duration::from_secs(60));
+        assert_eq!(nack_backoff(100), Duration::from_secs(60));
+        assert_eq!(nack_backoff(u32::MAX), Duration::from_secs(60));
     }
 
     #[test]
@@ -1000,6 +1094,23 @@ mod tests {
                 ReserveOptionsError::EmptyWorkerId
             ))
         ));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "wait_timeout must be non-zero")]
+    async fn worker_with_wait_timeout_zero_panics() {
+        let client = worker_test_client();
+        let _w = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .with_wait_timeout(Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn worker_with_wait_timeout_accepts_non_zero() {
+        let client = worker_test_client();
+        let _w = Worker::new(client, ["q"], Duration::from_secs(1))
+            .unwrap()
+            .with_wait_timeout(Duration::from_millis(1));
     }
 
     #[tokio::test]

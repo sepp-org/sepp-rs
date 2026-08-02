@@ -2,6 +2,7 @@
 name = "sepp-rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 description = "The official Rust client for sepp, a small, language-agnostic durable job queue"
 repository = "https://github.com/sepp-org/sepp-rs"
@@ -27,9 +28,13 @@ futures = "0.3.32"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1.44"
+gethostname = "1.1.0"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Only the `traced` example uses these (see [[example]] below). The exporter
 # deliberately lives in the host app, not the library.

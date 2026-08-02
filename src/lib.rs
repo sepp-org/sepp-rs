@@ -9,8 +9,8 @@
 //!   [`ack`](client::SeppClient::ack) / [`nack`](client::SeppClient::nack)
 //!   calls give you full manual control, while the high-level
 //!   [`Worker`](worker::Worker) runs the whole reserve → process → ack loop for
-//!   you with bounded concurrency, lease auto-extension, graceful shutdown and
-//!   metrics.
+//!   you with bounded concurrency, optional lease auto-extension, graceful
+//!   shutdown and metrics.
 //!
 //! # Quickstart
 //!
@@ -57,7 +57,7 @@
 //! tagged with a `job_type`. Workers reserve from one or more queues and
 //! dispatch each job to the handler registered for its `job_type`.
 //!
-//! **[`Payload`](Payload).** Every job can carry an opaque blob of bytes plus an encoding hint.
+//! **[`Payload`].** Every job can carry an opaque blob of bytes plus an encoding hint.
 //! You can use this to transport any data you want as long as producers and workers agree on the encoding.
 //! For a primitive key-value map, use [`custom`](EnqueueRequest::with_custom_entry) instead.
 //!
@@ -163,6 +163,11 @@ impl From<bool> for Primitive {
 /// sets and the worker reads to decide how to deserialize the bytes. A queue
 /// may restrict which encodings it accepts — see
 /// [`JobRejection::EncodingNotAllowed`].
+///
+/// The wire contract requires `data` (and `encoding`) to be non-empty: omit
+/// the payload entirely for jobs that carry no data, by never calling
+/// [`with_payload`](EnqueueRequest::with_payload). The server rejects an empty
+/// payload with [`JobRejection::InvalidRequest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payload {
     /// The raw payload bytes.
@@ -172,7 +177,8 @@ pub struct Payload {
 }
 
 impl Payload {
-    /// Creates a payload from its bytes and an encoding hint.
+    /// Creates a payload from its bytes and an encoding hint. Both must be
+    /// non-empty on the wire; jobs without data should carry no payload at all.
     pub fn new(data: Vec<u8>, encoding: impl Into<String>) -> Self {
         Self {
             data,
@@ -555,7 +561,8 @@ impl EnqueueRequest {
         })
     }
 
-    /// Sets the job's payload.
+    /// Sets the job's payload. Its `data` and `encoding` must be non-empty —
+    /// leave the payload unset for jobs that carry no data (see [`Payload`]).
     pub fn with_payload(mut self, payload: Payload) -> Self {
         self.payload = Some(payload);
         self
@@ -585,7 +592,7 @@ impl EnqueueRequest {
     /// Replaces the custom metadata map wholesale. See
     /// [`with_custom_entry`](Self::with_custom_entry) to add one key at a time.
     pub fn with_custom(mut self, custom: HashMap<String, Primitive>) -> Self {
-        self.custom = custom; // This is cheap enough that Optional is not needed
+        self.custom = custom;
         self
     }
 
@@ -677,7 +684,7 @@ pub enum JobRejection {
     #[error("queue {queue:?} is not declared on the server (strict mode)")]
     UnknownQueue { queue: String },
     /// The payload exceeds the queue's
-    /// [`max_payload_size`](ServerInfo::max_payload_size).
+    /// [`max_payload_bytes`](ServerInfo::max_payload_bytes).
     #[error("payload size {actual} bytes exceeds the queue limit of {limit}")]
     PayloadTooLarge { limit: u64, actual: u64 },
     /// The queue restricts encodings and the payload's encoding is not on the
@@ -876,6 +883,10 @@ pub struct JobCtx {
     pub max_attempts: u32,
     /// When the producer enqueued the job.
     pub enqueued_at: SystemTime,
+    /// When the producer scheduled the job to run, if it was
+    /// [delayed](EnqueueRequest::with_scheduled_at); `None` for a job that was
+    /// available immediately.
+    pub scheduled_at: Option<SystemTime>,
     /// Custom metadata the producer attached.
     pub custom: HashMap<String, Primitive>,
     /// The producer's trace context, if any and if it was well-formed.
@@ -1088,6 +1099,9 @@ pub(crate) fn job_from_pb(
             attempt: j.attempt,
             max_attempts: j.max_attempts,
             enqueued_at,
+            // Optional on the wire; a malformed value must not block delivery,
+            // so it degrades to None like an invalid trace context does.
+            scheduled_at: timestamp_to_system_time(j.scheduled_at),
             custom,
             trace_context,
             lease_expires_at,
@@ -1154,7 +1168,7 @@ impl ReserveOptions {
         }
         Ok(Self {
             queues,
-            wait_timeout: Duration::from_secs(30), // The server will hold the connection open for this long if no job is immediately available
+            wait_timeout: Duration::from_secs(30),
             lease_duration,
             worker_id: None,
             max_jobs: None,
@@ -1164,6 +1178,11 @@ impl ReserveOptions {
     /// Sets how long the server holds the connection open waiting for a job
     /// before returning empty. The server clamps this to its configured
     /// [`max_wait_timeout`](ServerInfo::max_wait_timeout).
+    ///
+    /// A zero (or tiny) wait makes the server answer immediately, so a naive
+    /// reserve loop turns into a hot loop of back-to-back RPCs — keep a real
+    /// wait for polling loops. ([`Worker`](worker::Worker) rejects a zero wait
+    /// outright and backs off on early-empty responses.)
     pub fn with_wait_timeout(mut self, wait: Duration) -> Self {
         self.wait_timeout = wait;
         self
@@ -1187,7 +1206,8 @@ impl ReserveOptions {
 
     /// Sets the maximum number of jobs to return in one response (default 1).
     /// The server clamps this to its
-    /// [`max_reserve_batch`](ServerInfo::max_reserve_batch).
+    /// [`max_reserve_batch`](ServerInfo::max_reserve_batch). `0` is invalid:
+    /// the server rejects it with `INVALID_ARGUMENT` on every call.
     pub fn with_max_jobs(mut self, max: u32) -> Self {
         self.max_jobs = Some(max);
         self
@@ -1235,7 +1255,7 @@ pub struct ServerInfo {
     /// is set.
     pub allowed_encodings: Vec<String>,
     /// Maximum payload size in bytes (→ [`JobRejection::PayloadTooLarge`]).
-    pub max_payload_size: u64,
+    pub max_payload_bytes: u64,
     /// Maximum entries in the custom map (→ [`JobRejection::CustomEntriesTooMany`]).
     pub max_custom_entries: u32,
     /// Maximum total bytes across the custom map (→ [`JobRejection::CustomMapTooLarge`]).
@@ -1276,8 +1296,8 @@ pub enum ServerInfoError {
     /// A required field (named in the payload) was absent.
     #[error("server info is missing required field `{0}`")]
     MissingField(&'static str),
-    /// `server_time_ms` was not a representable [`SystemTime`].
-    #[error("server_time_ms is not a representable time ({0}ms)")]
+    /// `server_time` was not a representable [`SystemTime`].
+    #[error("server_time is not a representable time ({0}ms)")]
     InvalidServerTime(i64),
 }
 
@@ -1298,7 +1318,7 @@ impl TryFrom<crate::pb::sepp::v1::GetServerInfoResponse> for ServerInfo {
             server_time,
             restricts_encodings: r.restricts_encodings,
             allowed_encodings: r.allowed_encodings,
-            max_payload_size: r.max_payload_bytes,
+            max_payload_bytes: r.max_payload_bytes,
             max_custom_entries: r.max_custom_entries,
             max_custom_total_bytes: r.max_custom_total_bytes,
             max_custom_key_bytes: r.max_custom_key_bytes,
@@ -1317,8 +1337,7 @@ impl TryFrom<crate::pb::sepp::v1::GetServerInfoResponse> for ServerInfo {
     }
 }
 
-/// Why a job was moved to the server's dead-letter store. Mirrors the
-/// terminal paths a job can take.
+/// Why a job was moved to the server's dead-letter store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DeadLetterCause {
@@ -1368,12 +1387,18 @@ pub struct DeadLetterRecord {
     pub payload: Option<Payload>,
     /// The job's effective priority.
     pub priority: Priority,
+    /// The maximum delivery attempts the job died with (the producer's
+    /// override, or the queue default the server applied).
+    pub max_attempts: u32,
     /// Custom metadata the producer attached.
     pub custom: HashMap<String, Primitive>,
     /// The producer's trace context, if any and well-formed.
     pub trace_context: Option<TraceContext>,
     /// When the producer originally enqueued the job.
     pub enqueued_at: SystemTime,
+    /// When the producer scheduled the job to run, if it was delayed; `None`
+    /// for a job that was available immediately.
+    pub scheduled_at: Option<SystemTime>,
     /// Why the job was dead-lettered.
     pub cause: DeadLetterCause,
     /// When the job was dead-lettered.
@@ -1387,9 +1412,11 @@ pub struct DeadLetterRecord {
 
 impl DeadLetterRecord {
     /// Builds an [`EnqueueRequest`] that replays this job into its original
-    /// queue, preserving its payload, priority, custom metadata, and trace
-    /// context. The replay is a fresh job — the server assigns a new id and
-    /// resets the attempt counter.
+    /// queue, preserving its payload, priority, max attempts, custom metadata,
+    /// and trace context. The replay is a fresh job — the server assigns a new
+    /// id and resets the attempt counter — and it runs immediately: the
+    /// original `scheduled_at` is deliberately not copied, since it is in the
+    /// past by the time a job has died and been drained.
     ///
     /// Equivalent to `EnqueueRequest::from(&record)`; both leave the record
     /// intact. To consume the record without cloning, use
@@ -1408,9 +1435,11 @@ impl From<DeadLetterRecord> for EnqueueRequest {
             payload: r.payload,
             idempotency_key: None,
             priority: Some(r.priority),
-            max_attempts: None,
+            max_attempts: Some(r.max_attempts),
             custom: r.custom,
             trace_context: r.trace_context,
+            // Deliberately not copied: a replayed job should run now, not be
+            // re-scheduled to a time that has already passed.
             scheduled_at: None,
         }
     }
@@ -1426,9 +1455,11 @@ impl From<&DeadLetterRecord> for EnqueueRequest {
             payload: r.payload.clone(),
             idempotency_key: None,
             priority: Some(r.priority),
-            max_attempts: None,
+            max_attempts: Some(r.max_attempts),
             custom: r.custom.clone(),
             trace_context: r.trace_context.clone(),
+            // Deliberately not copied: a replayed job should run now, not be
+            // re-scheduled to a time that has already passed.
             scheduled_at: None,
         }
     }
@@ -1483,9 +1514,13 @@ pub(crate) fn dead_letter_record_from_pb(
         job_type: j.job_type,
         payload: j.payload.map(Into::into),
         priority,
+        max_attempts: j.max_attempts,
         custom,
         trace_context,
         enqueued_at,
+        // Optional on the wire; a malformed value must not block the drain,
+        // so it degrades to None like an invalid trace context does.
+        scheduled_at: timestamp_to_system_time(j.scheduled_at),
         cause,
         failed_at,
         final_attempt: r.final_attempt,
@@ -2222,6 +2257,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn job_from_pb_carries_scheduled_at() {
+        let client = test_client();
+        let mut p = valid_job_pb();
+        p.scheduled_at = Some(ts(1_700_000_030, 0));
+        let job = job_from_pb(&client, p, None).unwrap();
+        assert_eq!(
+            job.ctx.scheduled_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_030))
+        );
+    }
+
+    #[tokio::test]
+    async fn job_from_pb_unscheduled_job_has_no_scheduled_at() {
+        let client = test_client();
+        let job = job_from_pb(&client, valid_job_pb(), None).unwrap();
+        assert_eq!(job.ctx.scheduled_at, None);
+    }
+
+    #[tokio::test]
+    async fn job_from_pb_invalid_scheduled_at_degrades_to_none() {
+        let client = test_client();
+        let mut p = valid_job_pb();
+        p.scheduled_at = Some(ts(-1, 0));
+        let job = job_from_pb(&client, p, None).unwrap();
+        assert_eq!(job.ctx.scheduled_at, None);
+    }
+
+    #[tokio::test]
     async fn job_from_pb_drops_invalid_trace_context() {
         let client = test_client();
         let mut p = valid_job_pb();
@@ -2460,7 +2523,7 @@ mod tests {
         assert_eq!(info.supported_protocol_versions, vec!["v1".to_string()]);
         assert_eq!(info.allowed_encodings, vec!["json".to_string()]);
         assert!(!info.restricts_encodings);
-        assert_eq!(info.max_payload_size, 1024);
+        assert_eq!(info.max_payload_bytes, 1024);
         assert_eq!(info.max_custom_entries, 10);
         assert_eq!(info.max_custom_total_bytes, 2048);
         assert_eq!(info.max_custom_key_bytes, 64);
@@ -2545,6 +2608,8 @@ mod tests {
         assert_eq!(r.final_attempt, 5);
         assert_eq!(r.last_reason.as_deref(), Some("boom"));
         assert_eq!(r.priority.get(), 3);
+        assert_eq!(r.max_attempts, 5);
+        assert_eq!(r.scheduled_at, None);
         assert_eq!(
             r.enqueued_at,
             SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000)
@@ -2552,6 +2617,21 @@ mod tests {
         assert_eq!(
             r.failed_at,
             SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_100_000)
+        );
+    }
+
+    #[test]
+    fn dead_letter_record_carries_scheduled_at() {
+        let mut job = valid_job_pb();
+        job.scheduled_at = Some(ts(1_700_000_050, 0));
+        let r = dead_letter_record_from_pb(pb::DeadLetterRecord {
+            job: Some(job),
+            ..valid_dead_letter_pb()
+        })
+        .unwrap();
+        assert_eq!(
+            r.scheduled_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_050))
         );
     }
 
@@ -2594,6 +2674,36 @@ mod tests {
     }
 
     #[test]
+    fn dead_letter_record_replay_preserves_max_attempts() {
+        let mut job = valid_job_pb();
+        job.max_attempts = 1; // deliberately never retried
+        let r = dead_letter_record_from_pb(pb::DeadLetterRecord {
+            job: Some(job),
+            ..valid_dead_letter_pb()
+        })
+        .unwrap();
+
+        let req: pb::EnqueueRequest = r.to_enqueue_request().into();
+        assert_eq!(req.max_attempts, Some(1));
+    }
+
+    #[test]
+    fn dead_letter_record_replay_does_not_reschedule() {
+        // A dead job's scheduled_at is in the past by the time it is drained;
+        // the replay must run now instead of copying it.
+        let mut job = valid_job_pb();
+        job.scheduled_at = Some(ts(1_700_000_050, 0));
+        let r = dead_letter_record_from_pb(pb::DeadLetterRecord {
+            job: Some(job),
+            ..valid_dead_letter_pb()
+        })
+        .unwrap();
+
+        let req: pb::EnqueueRequest = r.to_enqueue_request().into();
+        assert_eq!(req.scheduled_at, None);
+    }
+
+    #[test]
     fn dead_letter_record_converts_into_enqueue_request() {
         // The owned `From` consumes the record so a caller can write
         // `client.enqueue(record.into())` with no clone.
@@ -2602,6 +2712,7 @@ mod tests {
         assert_eq!(req.queue, "emails");
         assert_eq!(req.job_type, "send_email");
         assert_eq!(req.priority, Some(3));
+        assert_eq!(req.max_attempts, Some(5));
     }
 
     #[test]

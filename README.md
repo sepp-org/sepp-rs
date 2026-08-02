@@ -32,10 +32,10 @@
 
 ## Functionality
 
-- **Producers** — enqueue jobs one at a time, in best-effort batches, or atomically. Supports idempotency keys, priorities, scheduled delivery and custom metadata.
-- **Consumers** — a high-level `Worker` runs the whole reserve → process → ack loop for you with bounded concurrency, automatic lease extension and graceful shutdown, or drop down to the raw `reserve` / `ack` / `nack` / `extend` calls for full control.
-- **Observability** — with the default `opentelemetry` feature, the client emits `tracing` spans and metrics and propagates W3C trace context from the producer's enqueue span to the worker's process span. The host application owns the exporter.
-- **Typed errors** — deterministic server rejections (payload too large, unknown queue, …) are separate from transient transport errors, so retry logic stays simple.
+- Enqueue jobs one at a time, in best-effort batches, or atomically, with idempotency keys, priorities, scheduled delivery and custom metadata.
+- A high-level `Worker` runs the whole reserve → process → ack loop for you with bounded concurrency, optional automatic lease extension and graceful shutdown; or drop down to the raw `reserve` / `ack` / `nack` / `extend` calls for full control.
+- Opt-in retries for transient RPC failures via `RetryPolicy`. Retried enqueues can duplicate jobs that carry no idempotency key, so such requests are not retried on ambiguous failures.
+- With the default `opentelemetry` feature, the client emits `tracing` spans and metrics and propagates W3C trace context from the producer's enqueue span to the worker's process span. The host application owns the exporter.
 
 The client is async-only and requires a [tokio](https://docs.rs/tokio) runtime.
 
