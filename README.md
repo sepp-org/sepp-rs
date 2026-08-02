@@ -13,10 +13,10 @@
   </p>
 
   <p>
-    <a href="https://github.com/sepp-org/sepp-rs/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/sepp-org/sepp-rs/ci.yml?branch=master&labelColor=181512"></a>
-    <a href="https://crates.io/crates/sepp-rs"><img alt="crates.io" src="https://img.shields.io/crates/v/sepp-rs?labelColor=181512"></a>
-    <a href="https://docs.rs/sepp-rs"><img alt="docs.rs" src="https://img.shields.io/docsrs/sepp-rs?labelColor=181512"></a>
-    <a href="LICENSE"><img alt="license" src="https://img.shields.io/crates/l/sepp-rs?color=ec6a2e&labelColor=181512"></a>
+    <a href="https://github.com/sepp-org/sepp-rs/actions"><img alt="CI" src="https://badgers.space/github/checks/sepp-org/sepp-rs/master?label=CI&label_color=181512"></a>
+    <a href="https://crates.io/crates/sepp-rs"><img alt="crates.io" src="https://badgers.space/crates/version/sepp-rs?label_color=181512"></a>
+    <a href="https://docs.rs/sepp-rs"><img alt="docs.rs" src="https://docs.rs/sepp-rs/badge.svg"></a>
+    <a href="LICENSE"><img alt="license" src="https://badgers.space/github/license/sepp-org/sepp-rs?label_color=181512&color=ec6a2e"></a>
   </p>
 
   <p>
